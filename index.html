@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>VEX Part Manager — CAD Analyzer</title>
+    <link rel="stylesheet" href="./style.css" />
+    <link rel="preconnect" href="https://cdn.jsdelivr.net" />
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+          "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo" aria-hidden="true">⬢</span>
+        <div class="brand-text">
+          <h1>VEX Part Manager</h1>
+          <p>Drop a CAD file. Get a part list, 3D explode view, and one-click ordering.</p>
+        </div>
+      </div>
+      <div class="topbar-actions">
+        <label class="control">
+          <span>Units</span>
+          <select id="unitsSelect">
+            <option value="auto" selected>Auto-detect</option>
+            <option value="in">Inches</option>
+            <option value="mm">Millimeters</option>
+            <option value="cm">Centimeters</option>
+            <option value="m">Meters</option>
+          </select>
+        </label>
+        <button class="btn ghost" id="resetBtn" title="Reset view">Reset view</button>
+        <button class="btn primary" id="explodeBtn" title="Explode/assemble parts" disabled>
+          <span class="btn-label">Explode</span>
+        </button>
+        <button class="btn ghost" id="clearBtn" title="Clear and start over" disabled>Clear</button>
+      </div>
+    </header>
+
+    <main class="app">
+      <aside class="sidebar" id="sidebar" aria-label="Detected parts">
+        <div class="sidebar-header">
+          <h2>Detected parts</h2>
+          <p id="partsSummary" class="muted">No CAD file loaded</p>
+        </div>
+        <div class="categories" id="categories">
+          <!-- categories injected by JS -->
+        </div>
+        <div class="cart-actions">
+          <button class="btn primary block" id="openVexBtn" disabled>Search all on VEX</button>
+          <button class="btn ghost block" id="openRoboBtn" disabled>Search all on Robosource</button>
+          <button class="btn ghost block" id="exportBtn" disabled>Export CSV</button>
+        </div>
+      </aside>
+
+      <section class="viewer-wrap">
+        <div id="dropzone" class="dropzone">
+          <div class="dropzone-inner">
+            <div class="dropzone-icon">⤓</div>
+            <h2>Drop your CAD file here</h2>
+            <p>or</p>
+            <label class="btn primary">
+              <input id="fileInput" type="file" accept=".stl,.obj,.step,.stp,.STL,.OBJ,.STEP,.STP" hidden />
+              Choose file
+            </label>
+            <p class="muted small">Supports STL, OBJ, STEP/STP &nbsp;•&nbsp; up to ~100 MB</p>
+            <ul class="features">
+              <li>Auto-detects c-channels, standoffs, shafts, gears, wheels and more</li>
+              <li>Interactive rotate, zoom, and click-to-inspect</li>
+              <li>Animated explode view by part category</li>
+              <li>One-click ordering links to VEX &amp; Robosource</li>
+            </ul>
+          </div>
+        </div>
+
+        <canvas id="canvas3d"></canvas>
+
+        <div id="loadingOverlay" class="loading-overlay" hidden>
+          <div class="spinner"></div>
+          <p id="loadingMsg">Parsing CAD…</p>
+        </div>
+
+        <div class="viewer-hud" id="viewerHud" hidden>
+          <div class="hud-row">
+            <span id="fileNameLabel" class="muted small">file.stl</span>
+            <span class="dot"></span>
+            <span id="partCountLabel" class="muted small">0 parts</span>
+            <span class="dot"></span>
+            <span id="bboxLabel" class="muted small">— × — × —</span>
+          </div>
+          <div class="hud-row">
+            <label class="toggle">
+              <input type="checkbox" id="ghostToggle" checked />
+              <span>Show assembly outline</span>
+            </label>
+            <label class="toggle">
+              <input type="checkbox" id="wireToggle" />
+              <span>Wireframe</span>
+            </label>
+            <label class="toggle">
+              <input type="checkbox" id="autoRotateToggle" />
+              <span>Auto-rotate</span>
+            </label>
+            <label class="toggle slider-toggle">
+              <span>Explode</span>
+              <input type="range" id="explodeRange" min="0" max="100" value="0" />
+            </label>
+          </div>
+        </div>
+
+        <div id="selectionInfo" class="selection-info" hidden>
+          <button class="close" id="closeSelection" title="Close">×</button>
+          <h3 id="selName">Part</h3>
+          <p id="selMeta" class="muted small"></p>
+          <div class="link-row">
+            <a id="selVexLink" class="btn primary small" href="#" target="_blank" rel="noopener">Order on VEX</a>
+            <a id="selRoboLink" class="btn ghost small" href="#" target="_blank" rel="noopener">Find on Robosource</a>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <span class="muted small">
+        Heuristic classifier — verify parts before ordering. Not affiliated with VEX Robotics or Robosource.
+      </span>
+    </footer>
+
+    <script type="module" src="./src/main.js"></script>
+  </body>
+</html>
