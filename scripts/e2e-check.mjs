@@ -129,14 +129,13 @@ async function main() {
     nodeId: findNode.nodeId,
   });
 
-  // Some Chrome versions don\'t dispatch the change event from
-  // setFileInputFiles when the input is hidden. Verify by reading the value
-  // back, and manually dispatch change if needed.
+  // Verify the file was set; if Chrome didn\'t auto-dispatch change for the
+  // hidden input, fire it ourselves.
   await send("Runtime.evaluate", {
     expression: `(() => {
       const fi = document.getElementById('fileInput');
       console.log('after upload, files=', fi?.files?.length, fi?.files?.[0]?.name);
-      fi.dispatchEvent(new Event('change', { bubbles: true }));
+      if (!window.__cadLoaded) fi.dispatchEvent(new Event('change', { bubbles: true }));
     })()`,
   });
 
