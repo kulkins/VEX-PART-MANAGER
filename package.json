@@ -1,0 +1,24 @@
+{
+  "name": "vex-part-manager",
+  "version": "0.1.0",
+  "description": "Browser-based CAD analyzer for VEX Robotics designs.",
+  "private": true,
+  "scripts": {
+    "serve": "python3 -m http.server 8000",
+    "make-fixture": "node scripts/make-fixture.mjs",
+    "test:smoke": "node scripts/headless-check.mjs",
+    "test:e2e": "node scripts/e2e-check.mjs",
+    "test": "node scripts/headless-check.mjs && node scripts/e2e-check.mjs"
+  },
+  "devDependencies": {
+    "ws": "^8.18.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kulkins/VEX-PART-MANAGER.git"
+  },
+  "bugs": {
+    "url": "https://github.com/kulkins/VEX-PART-MANAGER/issues"
+  },
+  "license": "ISC"
+}
