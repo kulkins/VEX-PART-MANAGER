@@ -143,23 +143,10 @@ async function loadFile(file) {
   cancelParse();
 
   // STEP files still need a soft prompt above ~50 MB because WASM
-  // tessellation has its own memory budget unrelated to rendering.
-  // For STL / ZIP we let the parser's auto-simplifier handle any size:
-  // the Quality preset keeps GPU usage bounded regardless of part count.
-  const sizeMB = file.size / (1024 * 1024);
-  const ext = file.name.toLowerCase().split(".").pop();
-  if ((ext === "step" || ext === "stp") && sizeMB > 50) {
-    const ok = window.confirm(
-      `This STEP file is ${sizeMB.toFixed(0)} MB.\n\n` +
-        "STEP tessellation runs in a WASM worker and gets slow above ~50 MB. " +
-        "For big assemblies, prefer exporting as a ZIP of STL files (Onshape: " +
-        "Download → STL → Group into one file: No), then drop the ZIP here — " +
-        "that path auto-simplifies and dedupes parts.\n\n" +
-        "Click OK to try the STEP anyway, or Cancel.",
-    );
-    if (!ok) return;
-  }
-
+  // No upfront size confirm anymore: STEP tessellation now uses
+  // size-aware deflection in the worker (coarser for big files) and the
+  // result feeds the same simplify + dedup pipeline as ZIP, so big
+  // assemblies are handled instead of refused.
   const myToken = ++currentLoadToken;
   showLoading("Loading…", `Reading ${file.name}`);
   try {

@@ -96,7 +96,7 @@ export async function parseCadFile(
   } else if (ext === "step" || ext === "stp") {
     report("Loading STEP decoder (≈5 MB WASM, first time only)");
     await yieldUI();
-    assembly = await parseStepFile(file, report);
+    assembly = await parseStepFile(file, report, quality);
     if (detectedUnits === "unknown") detectedUnits = "mm";
   } else if (ext === "zip") {
     report("Reading ZIP archive");
@@ -572,7 +572,7 @@ export function cancelActiveStepWorker() {
   }
 }
 
-async function parseStepFile(file, report) {
+async function parseStepFile(file, report, quality = "auto") {
   let worker;
   try {
     worker = new Worker(new URL("./step.worker.js", import.meta.url), {
@@ -588,41 +588,53 @@ async function parseStepFile(file, report) {
   activeStepWorker = worker;
 
   const buffer = await file.arrayBuffer();
-  const meshes = await new Promise((resolve, reject) => {
-    worker.onmessage = (ev) => {
-      const m = ev.data;
-      if (m.type === "progress") {
-        report?.(m.text);
-      } else if (m.type === "done") {
-        resolve(m.meshes);
-      } else if (m.type === "error") {
-        reject(new Error(m.message));
-      }
-    };
-    worker.onerror = (e) => {
-      reject(new Error(e.message || "STEP worker crashed"));
-    };
-    worker.postMessage({ type: "parse", buffer }, [buffer]);
-  }).finally(() => {
-    if (activeStepWorker === worker) activeStepWorker = null;
-    worker.terminate();
-  });
+  const fileSizeMB = buffer.byteLength / (1024 * 1024);
 
-  report?.(`Building ${meshes.length} mesh(es)`);
-  await yieldUI();
+  // Decide the quality preset up-front so we can use it for the worker's
+  // tessellation deflection AND the post-tessellation simplifier.
+  const chosenQuality =
+    quality === "auto"
+      ? (fileSizeMB > 80 ? "low" : fileSizeMB > 25 ? "medium" : "high")
+      : quality;
+  const preset = QUALITY[chosenQuality] || QUALITY.medium;
+
   const assembly = new THREE.Group();
-  for (let i = 0; i < meshes.length; i++) {
-    const m = meshes[i];
+  let total = 0;
+  let built = 0;
+  let rawTris = 0;
+  let keptTris = 0;
+  let lastBuildReport = performance.now();
+
+  const buildOne = async (m) => {
     const g = new THREE.BufferGeometry();
     g.setAttribute("position", new THREE.BufferAttribute(m.position, 3));
     if (m.normal)
       g.setAttribute("normal", new THREE.BufferAttribute(m.normal, 3));
-    if (m.index) g.setIndex(new THREE.BufferAttribute(m.index, 1));
+    if (m.indexArray)
+      g.setIndex(new THREE.BufferAttribute(m.indexArray, 1));
     if (!m.normal) g.computeVertexNormals();
-    const mesh = makePartMesh(g);
+
+    const triCount = m.indexArray
+      ? m.indexArray.length / 3
+      : m.position.length / 9;
+    rawTris += triCount;
+
+    let finalGeom = g;
+    if (preset.cluster !== Infinity && triCount > preset.perPart) {
+      const simpler = simplifyGeometry(g, preset.cluster);
+      if (simpler !== g) {
+        g.dispose();
+        finalGeom = simpler;
+      }
+    }
+    const finalTris = finalGeom.getIndex()
+      ? finalGeom.getIndex().count / 3
+      : finalGeom.getAttribute("position").count / 3;
+    keptTris += finalTris;
+
+    const mesh = makePartMesh(finalGeom);
     if (m.name) mesh.userData.sourceName = m.name;
     if (m.color) {
-      // STEP colors come through as [r, g, b] floats in 0..1
       mesh.userData.sourceColor = new THREE.Color(
         m.color[0],
         m.color[1],
@@ -630,11 +642,69 @@ async function parseStepFile(file, report) {
       ).getHex();
     }
     assembly.add(mesh);
-    if (i % 16 === 0) {
-      report?.(`Building mesh ${i + 1} / ${meshes.length}`);
+    built++;
+
+    if (performance.now() - lastBuildReport > 150) {
+      lastBuildReport = performance.now();
+      const ratio = rawTris > 0 ? Math.round((1 - keptTris / rawTris) * 100) : 0;
+      report?.(
+        `Building parts · ${built} / ${total || "?"} · ${keptTris.toLocaleString()} kept / ${rawTris.toLocaleString()} raw tris (-${ratio}%)`,
+      );
       await yieldUI();
     }
+  };
+
+  await new Promise((resolve, reject) => {
+    worker.onmessage = (ev) => {
+      const m = ev.data;
+      switch (m.type) {
+        case "progress":
+          report?.(m.text);
+          break;
+        case "meshcount":
+          total = m.count;
+          report?.(`Streaming ${total} mesh(es)`);
+          break;
+        case "mesh":
+          // Fire-and-forget: meshes pile up in the message queue and are
+          // processed in order. Awaiting here would back-pressure the
+          // worker for no benefit.
+          buildOne(m);
+          break;
+        case "done":
+          resolve();
+          break;
+        case "error":
+          reject(new Error(m.message));
+          break;
+      }
+    };
+    worker.onerror = (e) => {
+      reject(new Error(e.message || "STEP worker crashed"));
+    };
+    worker.postMessage(
+      { type: "parse", buffer, quality: chosenQuality, autoSizeMB: fileSizeMB },
+      [buffer],
+    );
+  }).finally(() => {
+    if (activeStepWorker === worker) activeStepWorker = null;
+    worker.terminate();
+  });
+
+  // Drain any in-flight buildOne() promises.
+  await yieldUI();
+
+  if (assembly.children.length > 1) {
+    report?.("Deduplicating identical parts");
+    await yieldUI();
+    const allMeshes = [];
+    assembly.traverse((c) => { if (c.isMesh) allMeshes.push(c); });
+    const stats = dedupeGeometries(allMeshes);
+    report?.(
+      `Deduplicated · ${stats.totalCount} parts → ${stats.uniqueCount} unique geometries (saved ${stats.savedTris.toLocaleString()} duplicate triangles)`,
+    );
   }
+
   return assembly;
 }
 
