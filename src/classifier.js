@@ -111,12 +111,17 @@ function scorePart(part, f) {
   return s;
 }
 
-export function classifyAssembly(assembly, units) {
+export async function classifyAssembly(assembly, units, { onProgress } = {}) {
   const unitsScale = UNIT_TO_INCH[units] ?? 1;
   const results = [];
+  const meshes = [];
+  assembly.traverse((c) => { if (c.isMesh) meshes.push(c); });
 
-  assembly.traverse((c) => {
-    if (!c.isMesh) return;
+  const t0 = performance.now();
+  const yieldEvery = Math.max(16, Math.floor(meshes.length / 12));
+
+  for (let i = 0; i < meshes.length; i++) {
+    const c = meshes[i];
     const features = computeFeatures(c, unitsScale);
 
     let bestPart = null;
@@ -146,7 +151,15 @@ export function classifyAssembly(assembly, units) {
       categoryId,
       confidence: bestScore,
     });
-  });
+
+    if (i > 0 && i % yieldEvery === 0) {
+      onProgress?.(`Classifying ${i} / ${meshes.length}`);
+      await new Promise((r) => setTimeout(r, 0));
+    }
+  }
+  console.log(
+    `[classifier] ${meshes.length} parts in ${((performance.now() - t0) / 1000).toFixed(2)}s`,
+  );
 
   // Group identical parts: same part id => same line item with quantity.
   const items = new Map();

@@ -633,29 +633,130 @@ async function parseZip(file, report, unitHint) {
 
   const assembly = new THREE.Group();
   let units = "unknown";
-  for (let i = 0; i < members.length; i++) {
-    const memberName = members[i];
-    const memberBytes = entries[memberName];
-    report(`Parsing ${memberName} (${i + 1} / ${members.length})`);
-    await yieldUI();
-    // Wrap the inner bytes in a File so parseCadFile / parseStl can consume
-    // them with the same interface as a real upload.
-    const innerFile = new File([memberBytes], memberName, {
-      type: "application/octet-stream",
-    });
-    const inner = await parseCadFile(innerFile, {
-      onProgress: (m) => report(`${memberName}: ${m}`),
-      unitHint,
-    });
-    if (units === "unknown") units = inner.units;
-    inner.object.traverse((c) => {
-      if (c.isMesh && !c.userData.sourceName) {
-        c.userData.sourceName = memberName.replace(/\.[^.]+$/, "");
+
+  // Fast path: when every member is a single-part STL (Onshape's "one file
+  // per part" export), skip parseCadFile entirely. We just decode each
+  // STL's geometry directly into one mesh per member, batch UI yields,
+  // and auto-detect units once at the end. This avoids ~5 await yieldUI()
+  // calls per member that otherwise added up to many seconds.
+  const allStl = members.every((n) => /\.stl$/i.test(n));
+
+  if (allStl) {
+    const t0 = performance.now();
+    let totalTri = 0;
+    const step = Math.max(1, Math.floor(members.length / 12));
+    for (let i = 0; i < members.length; i++) {
+      const memberName = members[i];
+      const memberBytes = entries[memberName];
+      const { mesh, triangles } = decodeStlAsSingleMesh(
+        memberBytes,
+        memberName,
+      );
+      assembly.add(mesh);
+      totalTri += triangles;
+      if (i % step === 0 || i === members.length - 1) {
+        const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+        report(
+          `Parsing parts · ${i + 1} / ${members.length} · ${totalTri.toLocaleString()} triangles · ${elapsed}s`,
+        );
+        await yieldUI();
       }
-    });
-    while (inner.object.children.length) {
-      assembly.add(inner.object.children[0]);
+    }
+  } else {
+    // Mixed-format ZIP (e.g. a mix of STEP and STL): fall back to the full
+    // parser per member.
+    for (let i = 0; i < members.length; i++) {
+      const memberName = members[i];
+      const memberBytes = entries[memberName];
+      report(`Parsing ${memberName} (${i + 1} / ${members.length})`);
+      await yieldUI();
+      const innerFile = new File([memberBytes], memberName, {
+        type: "application/octet-stream",
+      });
+      const inner = await parseCadFile(innerFile, {
+        onProgress: (m) => report(`${memberName}: ${m}`),
+        unitHint,
+      });
+      if (units === "unknown") units = inner.units;
+      inner.object.traverse((c) => {
+        if (c.isMesh && !c.userData.sourceName) {
+          c.userData.sourceName = memberName.replace(/\.[^.]+$/, "");
+        }
+      });
+      while (inner.object.children.length) {
+        assembly.add(inner.object.children[0]);
+      }
     }
   }
+
+  if (units === "unknown" && (!unitHint || unitHint === "auto")) {
+    const bbox = new THREE.Box3().setFromObject(assembly);
+    const size = bbox.getSize(new THREE.Vector3());
+    const maxDim = Math.max(size.x, size.y, size.z);
+    if (maxDim > 80) units = "mm";
+    else if (maxDim > 8) units = "cm";
+    else if (maxDim > 0.05) units = "in";
+    else units = "m";
+  } else if (unitHint && unitHint !== "auto") {
+    units = unitHint;
+  }
+
   return { assembly, units };
+}
+
+// Decode an STL byte-buffer (ASCII or binary) into a single Three.js mesh.
+// No splitting, no vertex merging — used by the ZIP fast path where we
+// already know each file is one part.
+function decodeStlAsSingleMesh(bytes, name) {
+  const head = bytes.subarray(0, Math.min(256, bytes.length));
+  const headText = new TextDecoder("utf-8", { fatal: false }).decode(head);
+  const looksAscii =
+    headText.trimStart().toLowerCase().startsWith("solid") &&
+    headText.toLowerCase().includes("facet");
+
+  let geometry;
+  let triangles;
+  if (looksAscii) {
+    ({ geometry, triangles } = decodeAsciiStlGeometry(bytes));
+  } else {
+    ({ geometry, triangles } = decodeBinaryStlGeometry(bytes));
+  }
+  geometry.computeVertexNormals();
+  const mesh = makePartMesh(geometry);
+  mesh.userData.sourceName = name.replace(/\.[^.]+$/, "");
+  return { mesh, triangles };
+}
+
+function decodeBinaryStlGeometry(bytes) {
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const triCount = dv.getUint32(80, true);
+  const positions = new Float32Array(triCount * 9);
+  let off = 84;
+  for (let i = 0; i < triCount; i++) {
+    off += 12; // skip facet normal
+    for (let v = 0; v < 9; v++) {
+      positions[i * 9 + v] = dv.getFloat32(off, true);
+      off += 4;
+    }
+    off += 2; // skip the "attribute byte count" trailer
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+  return { geometry: g, triangles: triCount };
+}
+
+function decodeAsciiStlGeometry(bytes) {
+  const text = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+  const positions = [];
+  const re = /vertex\s+(-?[\d.eE+-]+)\s+(-?[\d.eE+-]+)\s+(-?[\d.eE+-]+)/g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    positions.push(+m[1], +m[2], +m[3]);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute(
+    "position",
+    new THREE.Float32BufferAttribute(positions, 3),
+  );
+  return { geometry: g, triangles: positions.length / 9 };
 }

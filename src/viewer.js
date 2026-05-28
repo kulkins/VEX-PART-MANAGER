@@ -295,25 +295,118 @@ export class Viewer {
 
   _buildGhostOutline() {
     if (!this.assembly) return;
-    const group = new THREE.Group();
+    // Defer ghost-outline construction off the main load tick so the user
+    // sees the solid meshes immediately, then schedule the edge extraction.
+    setTimeout(() => this._buildGhostOutlineAsync(), 16);
+  }
+
+  async _buildGhostOutlineAsync() {
+    if (!this.assembly) return;
+    const meshes = [];
     this.assembly.traverse((c) => {
-      if (!c.isMesh) return;
-      const edges = new THREE.EdgesGeometry(c.geometry, 22);
-      const line = new THREE.LineSegments(
-        edges,
-        new THREE.LineBasicMaterial({
-          color: 0x6ee7ff,
-          transparent: true,
-          opacity: 0.22,
-          depthWrite: false,
-        }),
-      );
-      c.updateMatrixWorld(true);
-      line.applyMatrix4(c.matrixWorld);
-      group.add(line);
+      if (c.isMesh) meshes.push(c);
     });
+
+    // For very large assemblies, skip per-mesh edge extraction (O(triangles)
+    // per part) and use bounding-box wireframes instead. Keeps the
+    // always-visible outline cheap even for 200+ part loads.
+    const useBoxes = meshes.length > 150;
+
+    // Concatenate all line segments into a single buffer so the GPU only
+    // has to issue one draw call.
+    const positions = [];
+    let totalTri = 0;
+    const t0 = performance.now();
+    for (let i = 0; i < meshes.length; i++) {
+      const c = meshes[i];
+      c.updateMatrixWorld(true);
+      const triCount =
+        (c.geometry.getIndex()?.count ?? c.geometry.getAttribute("position").count) / 3;
+      totalTri += triCount;
+
+      let segPos;
+      if (useBoxes) {
+        segPos = this._edgesOfBoundingBox(c);
+      } else {
+        const edges = new THREE.EdgesGeometry(c.geometry, 22);
+        segPos = this._transformEdgeArray(edges, c.matrixWorld);
+        edges.dispose();
+      }
+      for (let k = 0; k < segPos.length; k++) positions.push(segPos[k]);
+
+      if (i > 0 && i % 24 === 0) {
+        await new Promise((r) => setTimeout(r, 0));
+        if (!this.assembly) return; // clear() happened
+      }
+    }
+
+    const geom = new THREE.BufferGeometry();
+    geom.setAttribute(
+      "position",
+      new THREE.Float32BufferAttribute(positions, 3),
+    );
+    const material = new THREE.LineBasicMaterial({
+      color: 0x6ee7ff,
+      transparent: true,
+      opacity: 0.22,
+      depthWrite: false,
+    });
+    const merged = new THREE.LineSegments(geom, material);
+    const group = new THREE.Group();
+    group.add(merged);
     this.ghostGroup = group;
     this.scene.add(group);
+    this._updateGhostVisibility();
+    console.log(
+      `[viewer] ghost outline built · ${meshes.length} parts · ${totalTri.toLocaleString()} tris · ${useBoxes ? "bbox" : "edges"} · ${((performance.now() - t0) / 1000).toFixed(2)}s`,
+    );
+  }
+
+  _transformEdgeArray(edges, matrix) {
+    const pos = edges.getAttribute("position");
+    const out = new Float32Array(pos.count * 3);
+    const v = new THREE.Vector3();
+    for (let i = 0; i < pos.count; i++) {
+      v.fromBufferAttribute(pos, i).applyMatrix4(matrix);
+      out[i * 3] = v.x;
+      out[i * 3 + 1] = v.y;
+      out[i * 3 + 2] = v.z;
+    }
+    return out;
+  }
+
+  _edgesOfBoundingBox(mesh) {
+    mesh.geometry.computeBoundingBox();
+    const bb = mesh.geometry.boundingBox
+      .clone()
+      .applyMatrix4(mesh.matrixWorld);
+    const { min, max } = bb;
+    const c = [
+      [min.x, min.y, min.z],
+      [max.x, min.y, min.z],
+      [max.x, max.y, min.z],
+      [min.x, max.y, min.z],
+      [min.x, min.y, max.z],
+      [max.x, min.y, max.z],
+      [max.x, max.y, max.z],
+      [min.x, max.y, max.z],
+    ];
+    const idx = [
+      [0, 1], [1, 2], [2, 3], [3, 0],
+      [4, 5], [5, 6], [6, 7], [7, 4],
+      [0, 4], [1, 5], [2, 6], [3, 7],
+    ];
+    const out = new Float32Array(idx.length * 6);
+    for (let i = 0; i < idx.length; i++) {
+      const [a, b] = idx[i];
+      out[i * 6 + 0] = c[a][0];
+      out[i * 6 + 1] = c[a][1];
+      out[i * 6 + 2] = c[a][2];
+      out[i * 6 + 3] = c[b][0];
+      out[i * 6 + 4] = c[b][1];
+      out[i * 6 + 5] = c[b][2];
+    }
+    return out;
   }
 
   // User-controlled override. `null` resets to automatic (driven by explode).

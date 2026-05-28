@@ -186,7 +186,12 @@ async function loadFile(file) {
     els.loadingMsg.textContent = "Classifying parts…";
     els.loadingDetail.textContent = "";
     await new Promise((r) => setTimeout(r, 16));
-    const classification = classifyAssembly(object, units);
+    const classification = await classifyAssembly(object, units, {
+      onProgress: (m) => {
+        if (myToken !== currentLoadToken) return;
+        els.loadingDetail.textContent = m;
+      },
+    });
     currentClassification = classification;
 
     if (viewerReady) {
