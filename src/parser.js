@@ -676,22 +676,28 @@ async function parseZip(file, report, unitHint, quality = "auto") {
     throw new Error("ZIP did not contain any STL/OBJ/STEP files");
   }
 
-  // Pre-flight: sum uncompressed bytes and (for binary STL members) exact
-  // triangle counts. Used to pick the Quality preset when the caller said
-  // "auto", and to show the user what's about to load.
+  // Pre-flight: detect binary STL members via the exact file-size formula
+  // (size === 84 + tris*50). The previous heuristic (check whether byte 0
+  // is `s` or space) wrongly flagged some ASCII STLs as binary and then
+  // read garbage as the triangle count, producing absurd estimates (over
+  // 100 billion triangles for a 186-part ZIP) that tripped the refuse cap.
   let totalUncompressed = 0;
   let estimatedTris = 0;
+  let binaryCount = 0;
+  let asciiCount = 0;
   for (const name of members) {
     const b = entries[name];
     totalUncompressed += b.byteLength;
-    if (b.byteLength >= 84) {
-      const headByte = b[0];
-      if (headByte !== 0x73 && headByte !== 0x20) {
-        estimatedTris += new DataView(b.buffer, b.byteOffset, 84).getUint32(
-          80,
-          true,
-        );
-      }
+    const binTris = probeBinaryStlTriCount(b);
+    if (binTris >= 0) {
+      estimatedTris += binTris;
+      binaryCount++;
+    } else {
+      // ASCII STL: ~250 bytes/triangle is typical for VEX-precision exports.
+      // Used only for the Auto quality pick; the actual triangle count is
+      // reported during the parse.
+      estimatedTris += Math.max(0, Math.floor(b.byteLength / 250));
+      asciiCount++;
     }
   }
   const uncompressedMB = totalUncompressed / (1024 * 1024);
@@ -699,22 +705,20 @@ async function parseZip(file, report, unitHint, quality = "auto") {
     quality === "auto" ? autoQuality(members.length, estimatedTris) : quality;
   const preset = QUALITY[chosenKey] || QUALITY.medium;
   report(
-    `Archive has ${members.length} CAD file(s) · ${uncompressedMB.toFixed(1)} MB · ≈${estimatedTris.toLocaleString()} triangles · quality: ${preset.label}`,
+    `Archive has ${members.length} CAD file(s) (${binaryCount} binary, ${asciiCount} ASCII) · ${uncompressedMB.toFixed(1)} MB · ≈${estimatedTris.toLocaleString()} triangles · quality: ${preset.label}`,
   );
   await yieldUI();
   checkCancel(token);
 
-  if (uncompressedMB > SAFETY.REFUSE_UNCOMPRESSED_MB ||
-      estimatedTris > SAFETY.REFUSE_TRIANGLES) {
-    throw new Error(
-      `Archive is too large to load in-browser (${uncompressedMB.toFixed(0)} MB / ` +
-        `${estimatedTris.toLocaleString()} triangles). Re-export only the subassembly you need.`,
-    );
-  }
-  if (uncompressedMB > SAFETY.WARN_UNCOMPRESSED_MB ||
-      estimatedTris > SAFETY.WARN_TRIANGLES) {
+  // No upfront refusal anymore: the simplifier + dedup pipeline brings the
+  // GPU footprint down regardless of the raw count. We only warn so the
+  // user knows things might take a moment.
+  if (
+    uncompressedMB > SAFETY.WARN_UNCOMPRESSED_MB ||
+    estimatedTris > SAFETY.WARN_TRIANGLES
+  ) {
     report(
-      `Heads up: ${uncompressedMB.toFixed(0)} MB / ${estimatedTris.toLocaleString()} triangles — using ${preset.label} quality to keep the GPU happy. Use Cancel if it hangs.`,
+      `Heads up: ${uncompressedMB.toFixed(0)} MB · ≈${estimatedTris.toLocaleString()} triangles — using ${preset.label} quality. Use Cancel if it hangs.`,
     );
     await yieldUI();
   }
@@ -824,19 +828,29 @@ async function parseZip(file, report, unitHint, quality = "auto") {
 // Decode an STL byte-buffer (ASCII or binary) into a single Three.js mesh.
 // No splitting, no vertex merging — used by the ZIP fast path where we
 // already know each file is one part.
-function decodeStlAsSingleMesh(bytes, name) {
-  const head = bytes.subarray(0, Math.min(256, bytes.length));
-  const headText = new TextDecoder("utf-8", { fatal: false }).decode(head);
-  const looksAscii =
-    headText.trimStart().toLowerCase().startsWith("solid") &&
-    headText.toLowerCase().includes("facet");
+// Return the binary-STL triangle count if `bytes` is a valid binary STL,
+// or -1 otherwise. The format is 80-byte header + uint32 count + tris*50,
+// so file size must equal exactly 84 + tris*50 — that's the most reliable
+// way to tell binary apart from ASCII without misclassifying either.
+function probeBinaryStlTriCount(bytes) {
+  if (!bytes || bytes.byteLength < 84) return -1;
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, 84);
+  const tris = dv.getUint32(80, true);
+  if (tris > 0xfffffff) return -1; // 256M tris in one file — definitely garbage
+  return bytes.byteLength === 84 + tris * 50 ? tris : -1;
+}
 
+function decodeStlAsSingleMesh(bytes, name) {
+  // Prefer the size-formula check: if the file is exactly 84 + tris*50
+  // bytes, it's definitely binary STL no matter what the header text says.
+  // Otherwise fall back to ASCII.
+  const binTris = probeBinaryStlTriCount(bytes);
   let geometry;
   let triangles;
-  if (looksAscii) {
-    ({ geometry, triangles } = decodeAsciiStlGeometry(bytes));
-  } else {
+  if (binTris >= 0) {
     ({ geometry, triangles } = decodeBinaryStlGeometry(bytes));
+  } else {
+    ({ geometry, triangles } = decodeAsciiStlGeometry(bytes));
   }
   geometry.computeVertexNormals();
   const mesh = makePartMesh(geometry);

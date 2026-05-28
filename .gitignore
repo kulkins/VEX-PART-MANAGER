@@ -2,3 +2,4 @@ node_modules/
 *.log
 .DS_Store
 fixtures/assembly-heavy.zip
+fixtures/assembly-ascii.zip

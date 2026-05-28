@@ -32,6 +32,17 @@ function box(cx, cy, cz, sx, sy, sz) {
   return f.map(([a, b, c]) => [v[a], v[b], v[c]]);
 }
 
+function asciiStl(tris, name) {
+  let s = `solid ${name}\n`;
+  for (const t of tris) {
+    s += `  facet normal 0 0 0\n    outer loop\n`;
+    for (const v of t) s += `      vertex ${v[0]} ${v[1]} ${v[2]}\n`;
+    s += `    endloop\n  endfacet\n`;
+  }
+  s += `endsolid ${name}\n`;
+  return Buffer.from(s, "utf8");
+}
+
 function binStl(tris) {
   // 80-byte header + uint32 count + tri * 50 bytes
   const buf = Buffer.alloc(84 + tris.length * 50);
@@ -105,7 +116,8 @@ function writeZip(files) {
 
 const files = [];
 const partCount = Number(process.argv[2]) || 200;
-const subdiv = Number(process.argv[3]) || 1; // 1 = box (12 tris), N = tessellated sphere
+const subdiv = Number(process.argv[3]) || 1; // 1 = box, N = tessellated sphere
+const format = (process.argv[4] || "binary").toLowerCase(); // binary|ascii
 
 function sphereTris(cx, cy, cz, r, latSeg, lonSeg) {
   const tris = [];
@@ -140,7 +152,9 @@ for (let i = 0; i < partCount; i++) {
   else if (i % 4 === 1) tris = box(0, 0, 0, 0.125, 0.125, 6.0);
   else if (i % 4 === 2) tris = box(0, 0, 0, 0.27, 1.0, 0.27);
   else tris = box(0, 0, 0, 0.85, 0.25, 0.85);
-  files.push({ name: `Part-${String(i + 1).padStart(3, "0")}.stl`, data: binStl(tris) });
+  const partName = `Part-${String(i + 1).padStart(3, "0")}`;
+  const data = format === "ascii" ? asciiStl(tris, partName) : binStl(tris);
+  files.push({ name: `${partName}.stl`, data });
 }
 
 await fs.mkdir(path.dirname(out), { recursive: true });
