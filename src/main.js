@@ -1,4 +1,4 @@
-import { parseCadFile } from "./parser.js";
+import { parseCadFile, cancelActiveStepWorker } from "./parser.js";
 import { classifyAssembly } from "./classifier.js";
 import { CATEGORIES, buildBulkVexUrl, buildBulkRoboUrl } from "./partsdb.js";
 import { Sidebar, showToast } from "./ui.js";
@@ -135,6 +135,38 @@ function bindDropzone() {
 }
 
 async function loadFile(file) {
+  // Refuse / warn about files that are very likely to exhaust browser memory
+  // before we even start. STEP tessellation in WASM needs ~5–10x the file
+  // size in RAM, so we warn at 50 MB and hard-refuse at 200 MB.
+  const sizeMB = file.size / (1024 * 1024);
+  const ext = file.name.toLowerCase().split(".").pop();
+  if (ext === "step" || ext === "stp") {
+    if (sizeMB > 200) {
+      showToast(
+        `STEP file is ${sizeMB.toFixed(0)} MB — too large for in-browser tessellation. Export as STL from your CAD program and try again.`,
+        { error: true, duration: 8000 },
+      );
+      return;
+    }
+    if (sizeMB > 50) {
+      const ok = window.confirm(
+        `This STEP file is ${sizeMB.toFixed(0)} MB.\n\n` +
+          "STEP files need to be tessellated in the browser, which can take " +
+          "several minutes and may run the tab out of memory above ~50 MB.\n\n" +
+          "For files this large, the recommended workflow is:\n" +
+          "  • Export your CAD as STL\n" +
+          "  • Then drop the STL here\n\n" +
+          "Click OK to attempt to parse the STEP anyway, or Cancel and export STL.",
+      );
+      if (!ok) return;
+    }
+  } else if (sizeMB > 300) {
+    const ok = window.confirm(
+      `This ${ext.toUpperCase()} file is ${sizeMB.toFixed(0)} MB. Parsing may run the tab out of memory. Continue anyway?`,
+    );
+    if (!ok) return;
+  }
+
   const myToken = ++currentLoadToken;
   showLoading("Loading…", `Reading ${file.name}`);
   try {
@@ -379,6 +411,7 @@ function hideLoading() {
 
 els.cancelLoadingBtn?.addEventListener("click", () => {
   currentLoadToken++;
+  cancelActiveStepWorker();
   hideLoading();
   showToast("Cancelled", { error: true });
 });

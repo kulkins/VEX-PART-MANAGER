@@ -72,7 +72,10 @@
               <input id="fileInput" type="file" accept=".stl,.obj,.step,.stp,.STL,.OBJ,.STEP,.STP" hidden />
               Choose file
             </label>
-            <p class="muted small">Supports STL, OBJ, STEP/STP &nbsp;•&nbsp; up to ~100 MB</p>
+            <p class="muted small">Supports STL, OBJ, STEP/STP</p>
+            <p class="muted small" style="margin-top:0">
+              For big assemblies, export as <strong>STL</strong> from your CAD program — STEP files over ~50&nbsp;MB may exhaust the tab's memory.
+            </p>
             <ul class="features">
               <li>Auto-detects c-channels, standoffs, shafts, gears, wheels and more</li>
               <li>Interactive rotate, zoom, and click-to-inspect</li>
@@ -134,7 +137,7 @@
     <footer class="footer">
       <span class="muted small">
         Heuristic classifier — verify parts before ordering. Not affiliated with VEX Robotics or Robosource.
-        <span id="buildTag" class="muted">· build 2026-05-28a</span>
+        <span id="buildTag" class="muted">· build 2026-05-28b</span>
       </span>
     </footer>
 

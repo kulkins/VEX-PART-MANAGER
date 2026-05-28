@@ -332,80 +332,80 @@ function makePartMesh(geometry) {
 
 // ---------- STEP parsing ----------
 //
-// occt-import-js publishes a UMD bundle (OpenCascade compiled to WASM). We
-// inject it via a <script> tag and call its factory. The library is ~5 MB
-// so it's loaded lazily on the first STEP upload.
-let occtPromise = null;
-function loadOcct(report) {
-  if (occtPromise) return occtPromise;
-  const base = "https://cdn.jsdelivr.net/npm/occt-import-js@0.0.22/dist/";
-  occtPromise = new Promise((resolve, reject) => {
-    const finish = () => {
-      const factory = window.occtimportjs;
-      if (!factory) {
-        reject(new Error("occt-import-js loaded but global is missing"));
-        return;
-      }
-      report?.("Initialising STEP decoder");
-      factory({ locateFile: (name) => base + name })
-        .then(resolve)
-        .catch(reject);
-    };
-    if (window.occtimportjs) return finish();
-    const script = document.createElement("script");
-    script.src = base + "occt-import-js.js";
-    script.async = true;
-    script.onload = finish;
-    script.onerror = () =>
-      reject(new Error("Failed to fetch occt-import-js script"));
-    document.head.appendChild(script);
-  }).catch((e) => {
-    occtPromise = null;
-    throw e;
-  });
-  return occtPromise;
+// occt-import-js (OpenCascade WASM) is run inside a Web Worker so that long
+// tessellations don't freeze the main thread. The main thread retains a
+// handle (\`activeStepWorker\`) so the user-visible Cancel button can call
+// \`cancelActiveStepWorker()\` to terminate the work cleanly.
+
+let activeStepWorker = null;
+
+export function cancelActiveStepWorker() {
+  if (activeStepWorker) {
+    try {
+      activeStepWorker.terminate();
+    } catch (_) {
+      /* worker may already be gone */
+    }
+    activeStepWorker = null;
+  }
 }
 
 async function parseStepFile(file, report) {
-  let occt;
+  // Bail before transferring the buffer if the worker can't even be created
+  // (e.g. served from file://).
+  let worker;
   try {
-    occt = await loadOcct(report);
-  } catch (e) {
-    console.error(e);
+    worker = new Worker(new URL("./step.worker.js", import.meta.url), {
+      type: "classic",
+    });
+  } catch (err) {
+    console.error(err);
     throw new Error(
-      "STEP files require the OpenCascade WASM module, which failed to load. " +
-        "Check your network connection and try again, or export your CAD as STL/OBJ.",
+      "Couldn't start the STEP decoder worker. " +
+        "Try serving the site over http(s) (e.g. \`python3 scripts/serve.py\`) instead of opening the file directly.",
     );
   }
-  report?.("Tessellating STEP geometry");
+  activeStepWorker = worker;
+
+  const buffer = await file.arrayBuffer();
+  const meshes = await new Promise((resolve, reject) => {
+    worker.onmessage = (ev) => {
+      const m = ev.data;
+      if (m.type === "progress") {
+        report?.(m.text);
+      } else if (m.type === "done") {
+        resolve(m.meshes);
+      } else if (m.type === "error") {
+        reject(new Error(m.message));
+      }
+    };
+    worker.onerror = (e) => {
+      reject(new Error(e.message || "STEP worker crashed"));
+    };
+    // Transfer the underlying ArrayBuffer so we don't double our peak memory
+    // use; the main thread no longer needs it.
+    worker.postMessage({ type: "parse", buffer }, [buffer]);
+  }).finally(() => {
+    if (activeStepWorker === worker) activeStepWorker = null;
+    worker.terminate();
+  });
+
+  report?.(`Building ${meshes.length} mesh(es)`);
   await yieldUI();
-  const buffer = new Uint8Array(await file.arrayBuffer());
-  const result = occt.ReadStepFile(buffer, null);
-  if (!result || !result.success) {
-    throw new Error("Could not parse STEP file");
-  }
-
   const assembly = new THREE.Group();
-  for (let i = 0; i < (result.meshes || []).length; i++) {
-    const m = result.meshes[i];
-    const positions = new Float32Array(m.attributes.position.array);
-    const normals = m.attributes.normal
-      ? new Float32Array(m.attributes.normal.array)
-      : null;
-    const indices = m.index ? new Uint32Array(m.index.array) : null;
-
+  for (let i = 0; i < meshes.length; i++) {
+    const m = meshes[i];
     const g = new THREE.BufferGeometry();
-    g.setAttribute("position", new THREE.BufferAttribute(positions, 3));
-    if (normals)
-      g.setAttribute("normal", new THREE.BufferAttribute(normals, 3));
-    if (indices) g.setIndex(new THREE.BufferAttribute(indices, 1));
-    if (!normals) g.computeVertexNormals();
-
+    g.setAttribute("position", new THREE.BufferAttribute(m.position, 3));
+    if (m.normal)
+      g.setAttribute("normal", new THREE.BufferAttribute(m.normal, 3));
+    if (m.index) g.setIndex(new THREE.BufferAttribute(m.index, 1));
+    if (!m.normal) g.computeVertexNormals();
     const mesh = makePartMesh(g);
     if (m.name) mesh.userData.sourceName = m.name;
     assembly.add(mesh);
-    if (i % 10 === 0) {
-      report?.(`Building mesh ${i + 1} / ${result.meshes.length}`);
+    if (i % 16 === 0) {
+      report?.(`Building mesh ${i + 1} / ${meshes.length}`);
       await yieldUI();
     }
   }
