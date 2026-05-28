@@ -24,11 +24,32 @@ export class Viewer {
       canvas,
       antialias: true,
       alpha: true,
+      // Don't request high-performance; that can force the discrete GPU on
+      // some Macs and makes driver crashes on big scenes more likely.
+      powerPreference: "default",
     });
     this.renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
     this.renderer.shadowMap.enabled = true;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+    // GPU driver crashes can fire a "webglcontextlost" event. Surface it
+    // as a recoverable error instead of leaving the page silently dead.
+    this._contextLost = false;
+    canvas.addEventListener("webglcontextlost", (e) => {
+      e.preventDefault();
+      this._contextLost = true;
+      console.error("[viewer] WebGL context lost");
+      window.dispatchEvent(
+        new CustomEvent("viewer-context-lost", {
+          detail: { reason: e.statusMessage || "GPU context lost" },
+        }),
+      );
+    });
+    canvas.addEventListener("webglcontextrestored", () => {
+      this._contextLost = false;
+      console.log("[viewer] WebGL context restored");
+    });
 
     this.controls = new OrbitControls(this.camera, canvas);
     this.controls.enableDamping = true;
@@ -303,26 +324,62 @@ export class Viewer {
   async _buildGhostOutlineAsync() {
     if (!this.assembly) return;
     const meshes = [];
+    let totalTri = 0;
     this.assembly.traverse((c) => {
-      if (c.isMesh) meshes.push(c);
+      if (!c.isMesh) return;
+      meshes.push(c);
+      totalTri +=
+        (c.geometry.getIndex()?.count ??
+          c.geometry.getAttribute("position").count) / 3;
     });
 
-    // For very large assemblies, skip per-mesh edge extraction (O(triangles)
-    // per part) and use bounding-box wireframes instead. Keeps the
-    // always-visible outline cheap even for 200+ part loads.
-    const useBoxes = meshes.length > 150;
+    // Hard cap: above this many parts or triangles, skip the ghost outline
+    // entirely. The model is still visible as solid meshes; this just turns
+    // off the assembled-state cyan overlay so we don't allocate a giant GPU
+    // buffer that could crash the driver on macOS/Metal.
+    if (meshes.length > 400 || totalTri > 1_500_000) {
+      console.log(
+        `[viewer] ghost outline skipped (${meshes.length} parts, ${totalTri.toLocaleString()} tris) — too large for safe rendering`,
+      );
+      return;
+    }
 
-    // Concatenate all line segments into a single buffer so the GPU only
-    // has to issue one draw call.
-    const positions = [];
-    let totalTri = 0;
+    // Above 50 parts (or 250k triangles) we drop to bounding-box
+    // wireframes: 12 edges per part regardless of triangle count. Keeps
+    // CPU and GPU cost bounded.
+    const useBoxes = meshes.length > 50 || totalTri > 250_000;
+
+    // Pre-allocate a Float32Array of an upper bound on segment vertices so
+    // we never push millions of numbers into a regular JS array (which
+    // boxes each one and triggers many reallocations).
+    const upperBoundFloats = useBoxes
+      ? meshes.length * 12 * 2 * 3
+      : Math.min(totalTri * 9, 12_000_000);
+    let buf;
+    try {
+      buf = new Float32Array(upperBoundFloats);
+    } catch (err) {
+      console.warn("[viewer] could not allocate ghost outline buffer", err);
+      return;
+    }
+    let bufLen = 0;
+    const ensureRoom = (need) => {
+      if (bufLen + need <= buf.length) return true;
+      const newSize = Math.min(
+        12_000_000,
+        Math.max(buf.length * 2, bufLen + need),
+      );
+      if (newSize <= buf.length) return false;
+      const bigger = new Float32Array(newSize);
+      bigger.set(buf.subarray(0, bufLen));
+      buf = bigger;
+      return true;
+    };
+
     const t0 = performance.now();
     for (let i = 0; i < meshes.length; i++) {
       const c = meshes[i];
       c.updateMatrixWorld(true);
-      const triCount =
-        (c.geometry.getIndex()?.count ?? c.geometry.getAttribute("position").count) / 3;
-      totalTri += triCount;
 
       let segPos;
       if (useBoxes) {
@@ -332,19 +389,23 @@ export class Viewer {
         segPos = this._transformEdgeArray(edges, c.matrixWorld);
         edges.dispose();
       }
-      for (let k = 0; k < segPos.length; k++) positions.push(segPos[k]);
+      if (!ensureRoom(segPos.length)) {
+        console.warn("[viewer] ghost buffer overflow; truncating");
+        break;
+      }
+      buf.set(segPos, bufLen);
+      bufLen += segPos.length;
 
       if (i > 0 && i % 24 === 0) {
         await new Promise((r) => setTimeout(r, 0));
-        if (!this.assembly) return; // clear() happened
+        if (!this.assembly) return;
       }
     }
 
+    const finalPositions = new Float32Array(bufLen);
+    finalPositions.set(buf.subarray(0, bufLen));
     const geom = new THREE.BufferGeometry();
-    geom.setAttribute(
-      "position",
-      new THREE.Float32BufferAttribute(positions, 3),
-    );
+    geom.setAttribute("position", new THREE.BufferAttribute(finalPositions, 3));
     const material = new THREE.LineBasicMaterial({
       color: 0x6ee7ff,
       transparent: true,
@@ -537,7 +598,16 @@ export class Viewer {
 
   _tick() {
     this.controls.update();
-    this.renderer.render(this.scene, this.camera);
+    if (!this._contextLost) {
+      try {
+        this.renderer.render(this.scene, this.camera);
+      } catch (err) {
+        if (!this._renderErrorReported) {
+          console.error("[viewer] render error", err);
+          this._renderErrorReported = true;
+        }
+      }
+    }
     requestAnimationFrame(this._tick);
   }
 }

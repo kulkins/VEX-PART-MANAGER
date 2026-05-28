@@ -20,7 +20,39 @@ import { OBJLoader } from "three/addons/loaders/OBJLoader.js";
 
 const yieldUI = () => new Promise((r) => setTimeout(r, 0));
 
+// ---------- Safety budgets ----------
+// macOS Metal/ANGLE will crash the GPU driver (and sometimes the kernel)
+// when WebGL is asked to allocate buffers far above its limit. We refuse
+// or warn before that point. Numbers are conservative: a typical Mac
+// integrated GPU has 1-2 GB usable VRAM via WebGL, and we want to leave
+// headroom for shading and the ghost-outline buffer.
+export const SAFETY = {
+  WARN_TRIANGLES: 600_000,
+  REFUSE_TRIANGLES: 4_000_000,
+  WARN_UNCOMPRESSED_MB: 200,
+  REFUSE_UNCOMPRESSED_MB: 800,
+};
+
+// Cancellation token shared with main.js. Each user-initiated load
+// increments .id; the parser checks .id between yields and throws
+// `ParseCancelled` if the user pressed the Cancel button.
+export const parserCancel = { id: 0 };
+export class ParseCancelled extends Error {
+  constructor() {
+    super("Cancelled");
+    this.name = "ParseCancelled";
+  }
+}
+export function cancelParse() {
+  parserCancel.id++;
+  cancelActiveStepWorker();
+}
+const checkCancel = (token) => {
+  if (parserCancel.id !== token) throw new ParseCancelled();
+};
+
 export async function parseCadFile(file, { onProgress, unitHint } = {}) {
+  const token = parserCancel.id;
   const t0 = performance.now();
   const name = file.name.toLowerCase();
   const ext = name.split(".").pop();
@@ -30,6 +62,7 @@ export async function parseCadFile(file, { onProgress, unitHint } = {}) {
   };
   report(`Reading ${file.name} (${(file.size / 1e6).toFixed(2)} MB)`);
   await yieldUI();
+  checkCancel(token);
 
   let assembly;
   let detectedUnits = unitHint && unitHint !== "auto" ? unitHint : "unknown";
@@ -610,35 +643,81 @@ async function loadFflate() {
 }
 
 async function parseZip(file, report, unitHint) {
+  const token = parserCancel.id;
   const fflate = await loadFflate();
   const buffer = new Uint8Array(await file.arrayBuffer());
   report("Unzipping archive");
   await yieldUI();
+  checkCancel(token);
   const entries = await new Promise((resolve, reject) => {
     fflate.unzip(buffer, (err, unzipped) => {
       if (err) reject(err);
       else resolve(unzipped);
     });
   });
+  checkCancel(token);
 
   const supported = (name) =>
     /\.(stl|obj|step|stp)$/i.test(name) && !name.startsWith("__MACOSX/");
   const members = Object.keys(entries).filter(supported);
-  report(`Archive has ${members.length} CAD file(s)`);
-  await yieldUI();
-
   if (members.length === 0) {
     throw new Error("ZIP did not contain any STL/OBJ/STEP files");
+  }
+
+  // Pre-flight safety: sum uncompressed bytes and (for binary STL members)
+  // exact triangle counts. We can read each STL's triangle count without
+  // decoding the geometry, so this is O(member count), not O(geometry).
+  let totalUncompressed = 0;
+  let estimatedTris = 0;
+  for (const name of members) {
+    const b = entries[name];
+    totalUncompressed += b.byteLength;
+    // Binary STL: triangle count at byte offset 80
+    if (b.byteLength >= 84) {
+      // Skip ASCII members; we'll count them on the fly.
+      const headByte = b[0];
+      if (headByte !== 0x73 /* 's' */ && headByte !== 0x20 /* space */) {
+        estimatedTris += new DataView(b.buffer, b.byteOffset, 84).getUint32(80, true);
+      }
+    }
+  }
+  const uncompressedMB = totalUncompressed / (1024 * 1024);
+  report(
+    `Archive has ${members.length} CAD file(s) · ${uncompressedMB.toFixed(1)} MB · ≈${estimatedTris.toLocaleString()} triangles`,
+  );
+  await yieldUI();
+  checkCancel(token);
+
+  // Hard refuse anything that's certain to exhaust the GPU or browser memory.
+  if (
+    uncompressedMB > SAFETY.REFUSE_UNCOMPRESSED_MB ||
+    estimatedTris > SAFETY.REFUSE_TRIANGLES
+  ) {
+    throw new Error(
+      `Archive is too large for safe in-browser rendering (${uncompressedMB.toFixed(0)} MB / ` +
+        `${estimatedTris.toLocaleString()} triangles). The cap is ` +
+        `${SAFETY.REFUSE_UNCOMPRESSED_MB} MB / ${SAFETY.REFUSE_TRIANGLES.toLocaleString()} triangles ` +
+        `to protect the GPU driver. Re-export with a coarser STL resolution (in Onshape: ` +
+        `Download → STL → Resolution: Coarse), or export only the subassembly you need.`,
+    );
+  }
+  if (
+    uncompressedMB > SAFETY.WARN_UNCOMPRESSED_MB ||
+    estimatedTris > SAFETY.WARN_TRIANGLES
+  ) {
+    report(
+      `Heads up: ${uncompressedMB.toFixed(0)} MB / ${estimatedTris.toLocaleString()} triangles — ` +
+        `loading may be slow. Use the Cancel button if it hangs.`,
+    );
+    await yieldUI();
   }
 
   const assembly = new THREE.Group();
   let units = "unknown";
 
-  // Fast path: when every member is a single-part STL (Onshape's "one file
-  // per part" export), skip parseCadFile entirely. We just decode each
-  // STL's geometry directly into one mesh per member, batch UI yields,
-  // and auto-detect units once at the end. This avoids ~5 await yieldUI()
-  // calls per member that otherwise added up to many seconds.
+  // Fast path: every member is a single-part STL (Onshape's "one file per
+  // part" export). Decode each STL's geometry directly into one mesh per
+  // member with no splitting or vertex merging.
   const allStl = members.every((n) => /\.stl$/i.test(n));
 
   if (allStl) {
@@ -660,6 +739,16 @@ async function parseZip(file, report, unitHint) {
           `Parsing parts · ${i + 1} / ${members.length} · ${totalTri.toLocaleString()} triangles · ${elapsed}s`,
         );
         await yieldUI();
+        checkCancel(token);
+        // If triangle count balloons past the hard cap mid-parse (e.g. lots
+        // of ASCII STL members we couldn't pre-count), bail before we crash
+        // the GPU on the next allocation.
+        if (totalTri > SAFETY.REFUSE_TRIANGLES) {
+          throw new Error(
+            `Triangle count passed ${SAFETY.REFUSE_TRIANGLES.toLocaleString()} mid-parse — aborting to protect the GPU. ` +
+              `Re-export with a coarser STL resolution.`,
+          );
+        }
       }
     }
   } else {

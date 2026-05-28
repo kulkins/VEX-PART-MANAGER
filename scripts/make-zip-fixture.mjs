@@ -104,10 +104,39 @@ function writeZip(files) {
 }
 
 const files = [];
-for (let i = 0; i < 200; i++) {
+const partCount = Number(process.argv[2]) || 200;
+const subdiv = Number(process.argv[3]) || 1; // 1 = box (12 tris), N = tessellated sphere
+
+function sphereTris(cx, cy, cz, r, latSeg, lonSeg) {
+  const tris = [];
+  for (let i = 0; i < latSeg; i++) {
+    const lat1 = (Math.PI * i) / latSeg - Math.PI / 2;
+    const lat2 = (Math.PI * (i + 1)) / latSeg - Math.PI / 2;
+    for (let j = 0; j < lonSeg; j++) {
+      const lon1 = (2 * Math.PI * j) / lonSeg;
+      const lon2 = (2 * Math.PI * (j + 1)) / lonSeg;
+      const p = (lat, lon) => [
+        cx + r * Math.cos(lat) * Math.cos(lon),
+        cy + r * Math.sin(lat),
+        cz + r * Math.cos(lat) * Math.sin(lon),
+      ];
+      const a = p(lat1, lon1), b = p(lat2, lon1);
+      const c = p(lat2, lon2), d = p(lat1, lon2);
+      tris.push([a, b, c]);
+      tris.push([a, c, d]);
+    }
+  }
+  return tris;
+}
+
+for (let i = 0; i < partCount; i++) {
   // mix small parts: standoffs, screws, c-channels
   let tris;
-  if (i % 4 === 0) tris = box(0, 0, 0, 17.5, 0.5, 1.0);
+  if (subdiv > 1) {
+    // Heavy tessellation: a sphere with many segments per part. This
+    // simulates Onshape's "Fine" STL export of a curved component.
+    tris = sphereTris(0, 0, 0, 1.0, subdiv, subdiv * 2);
+  } else if (i % 4 === 0) tris = box(0, 0, 0, 17.5, 0.5, 1.0);
   else if (i % 4 === 1) tris = box(0, 0, 0, 0.125, 0.125, 6.0);
   else if (i % 4 === 2) tris = box(0, 0, 0, 0.27, 1.0, 0.27);
   else tris = box(0, 0, 0, 0.85, 0.25, 0.85);

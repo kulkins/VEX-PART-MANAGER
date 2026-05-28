@@ -1,4 +1,4 @@
-import { parseCadFile, cancelActiveStepWorker } from "./parser.js";
+import { parseCadFile, cancelParse, ParseCancelled } from "./parser.js";
 import { classifyAssembly } from "./classifier.js";
 import { CATEGORIES, buildBulkVexUrl, buildBulkRoboUrl } from "./partsdb.js";
 import { Sidebar, showToast } from "./ui.js";
@@ -137,6 +137,10 @@ function bindDropzone() {
 }
 
 async function loadFile(file) {
+  // If a previous parse is still running (worker, async classifier, etc.)
+  // cancel it before starting the new one.
+  cancelParse();
+
   // Refuse / warn about files that are very likely to exhaust browser memory
   // before we even start. STEP tessellation in WASM needs ~5–10x the file
   // size in RAM, so we warn at 50 MB and hard-refuse at 200 MB.
@@ -246,8 +250,12 @@ async function loadFile(file) {
       );
     }
   } catch (err) {
-    console.error(err);
     hideLoading();
+    if (err instanceof ParseCancelled || err?.name === "ParseCancelled") {
+      // The cancel button already showed a toast; nothing else to do.
+      return;
+    }
+    console.error(err);
     showToast(err.message || "Failed to load file", { error: true });
   }
 }
@@ -440,7 +448,16 @@ function hideLoading() {
 
 els.cancelLoadingBtn?.addEventListener("click", () => {
   currentLoadToken++;
-  cancelActiveStepWorker();
+  cancelParse();
   hideLoading();
   showToast("Cancelled", { error: true });
+});
+
+// If the WebGL context is lost (e.g. GPU driver hiccup on a very large
+// assembly), surface a clear toast instead of a silently broken page.
+window.addEventListener("viewer-context-lost", (ev) => {
+  showToast(
+    "GPU was overwhelmed and lost the WebGL context. Try reloading and importing a smaller assembly or a coarser STL export.",
+    { error: true, duration: 12000 },
+  );
 });
