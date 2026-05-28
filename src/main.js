@@ -9,6 +9,8 @@ const els = {
   canvas: document.getElementById("canvas3d"),
   loading: document.getElementById("loadingOverlay"),
   loadingMsg: document.getElementById("loadingMsg"),
+  loadingDetail: document.getElementById("loadingDetail"),
+  cancelLoadingBtn: document.getElementById("cancelLoadingBtn"),
   sidebar: document.getElementById("categories"),
   summary: document.getElementById("partsSummary"),
   hud: document.getElementById("viewerHud"),
@@ -33,6 +35,8 @@ const els = {
   selRoboLink: document.getElementById("selRoboLink"),
   closeSelection: document.getElementById("closeSelection"),
 };
+
+let currentLoadToken = 0;
 
 // Initialize the sidebar BEFORE the viewer so that even if WebGL fails to
 // initialize (headless / unsupported GPU) the parts UI still works.
@@ -131,15 +135,22 @@ function bindDropzone() {
 }
 
 async function loadFile(file) {
-  showLoading("Reading file…");
+  const myToken = ++currentLoadToken;
+  showLoading("Loading…", `Reading ${file.name}`);
   try {
     const unitHint = els.unitsSelect.value;
     const { object, units } = await parseCadFile(file, {
       unitHint,
-      onProgress: (msg) => (els.loadingMsg.textContent = msg + "…"),
+      onProgress: (msg) => {
+        if (myToken !== currentLoadToken) return;
+        els.loadingMsg.textContent = "Working…";
+        els.loadingDetail.textContent = msg;
+      },
     });
+    if (myToken !== currentLoadToken) return;
 
     els.loadingMsg.textContent = "Classifying parts…";
+    els.loadingDetail.textContent = "";
     await new Promise((r) => setTimeout(r, 16));
     const classification = classifyAssembly(object, units);
     currentClassification = classification;
@@ -357,10 +368,17 @@ els.exportBtn.addEventListener("click", () => {
 });
 
 // ---------- Loading helpers ----------
-function showLoading(msg) {
+function showLoading(msg, detail = "") {
   els.loading.hidden = false;
   els.loadingMsg.textContent = msg;
+  if (els.loadingDetail) els.loadingDetail.textContent = detail;
 }
 function hideLoading() {
   els.loading.hidden = true;
 }
+
+els.cancelLoadingBtn?.addEventListener("click", () => {
+  currentLoadToken++;
+  hideLoading();
+  showToast("Cancelled", { error: true });
+});

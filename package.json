@@ -4,7 +4,7 @@
   "description": "Browser-based CAD analyzer for VEX Robotics designs.",
   "private": true,
   "scripts": {
-    "serve": "python3 -m http.server 8000",
+    "serve": "python3 scripts/serve.py 8000",
     "make-fixture": "node scripts/make-fixture.mjs",
     "test:smoke": "node scripts/headless-check.mjs",
     "test:e2e": "node scripts/e2e-check.mjs",

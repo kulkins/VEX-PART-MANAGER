@@ -3,6 +3,9 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+    <meta http-equiv="Pragma" content="no-cache" />
+    <meta http-equiv="Expires" content="0" />
     <title>VEX Part Manager — CAD Analyzer</title>
     <link rel="stylesheet" href="./style.css" />
     <link rel="preconnect" href="https://cdn.jsdelivr.net" />
@@ -83,7 +86,9 @@
 
         <div id="loadingOverlay" class="loading-overlay" hidden>
           <div class="spinner"></div>
-          <p id="loadingMsg">Parsing CAD…</p>
+          <p id="loadingMsg">Loading…</p>
+          <p id="loadingDetail" class="muted small"></p>
+          <button class="btn ghost small" id="cancelLoadingBtn">Cancel</button>
         </div>
 
         <div class="viewer-hud" id="viewerHud" hidden>
@@ -129,6 +134,7 @@
     <footer class="footer">
       <span class="muted small">
         Heuristic classifier — verify parts before ordering. Not affiliated with VEX Robotics or Robosource.
+        <span id="buildTag" class="muted">· build 2026-05-28a</span>
       </span>
     </footer>
 

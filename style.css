@@ -503,9 +503,25 @@ body {
   align-items: center;
   justify-content: center;
   flex-direction: column;
-  gap: 14px;
+  gap: 12px;
   z-index: 4;
   backdrop-filter: blur(4px);
+  text-align: center;
+  padding: 24px;
+}
+
+.loading-overlay p {
+  margin: 0;
+  max-width: 480px;
+}
+
+.loading-overlay #loadingMsg {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.loading-overlay #cancelLoadingBtn {
+  margin-top: 6px;
 }
 
 .spinner {
