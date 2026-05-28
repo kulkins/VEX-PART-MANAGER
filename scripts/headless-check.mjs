@@ -127,6 +127,20 @@ async function main() {
     await new Promise((r) => setTimeout(r, 250));
   }
 
+  // The loading overlay must NOT be visible until the user uploads a file.
+  // Catches the CSS specificity bug where .loading-overlay { display: flex }
+  // overrode the [hidden] attribute.
+  const overlayVis = await send("Runtime.evaluate", {
+    expression: `(() => {
+      const el = document.getElementById('loadingOverlay');
+      const cs = getComputedStyle(el);
+      return { display: cs.display, hidden: el.hidden };
+    })()`,
+    returnByValue: true,
+  });
+  const overlay = overlayVis?.result?.result?.value || {};
+  console.log("Loading overlay state:", overlay);
+
   console.log("Categories rendered:", categoryCount);
   console.log("Console errors:", errors.length);
   for (const e of errors) console.log("  •", e);
@@ -137,6 +151,10 @@ async function main() {
 
   if (categoryCount < 6) process.exit(1);
   if (errors.length > 0) process.exit(2);
+  if (overlay.display !== "none") {
+    console.error("Loading overlay is visible on initial page load");
+    process.exit(4);
+  }
 }
 
 main().catch((e) => {

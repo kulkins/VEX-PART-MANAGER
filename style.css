@@ -21,6 +21,14 @@
   box-sizing: border-box;
 }
 
+/* The HTML "hidden" attribute must beat any class-level display rule on
+   the same element. Without this, classes like .loading-overlay { display:
+   flex; } override the attribute and the element stays visible. */
+[hidden] {
+  display: none !important;
+}
+
+
 html,
 body {
   height: 100%;
