@@ -38,6 +38,15 @@
             <option value="m">Meters</option>
           </select>
         </label>
+        <label class="control" title="Lower quality = fewer triangles per part = faster, works on bigger assemblies. Auto picks based on part count.">
+          <span>Quality</span>
+          <select id="qualitySelect">
+            <option value="auto" selected>Auto</option>
+            <option value="high">High (no simplify)</option>
+            <option value="medium">Medium</option>
+            <option value="low">Low (best for huge)</option>
+          </select>
+        </label>
         <button class="btn ghost" id="resetBtn" title="Reset view">Reset view</button>
         <button class="btn primary" id="explodeBtn" title="Explode/assemble parts" disabled>
           <span class="btn-label">Explode</span>
@@ -148,7 +157,7 @@
     <footer class="footer">
       <span class="muted small">
         Heuristic classifier — verify parts before ordering. Not affiliated with VEX Robotics or Robosource.
-        <span id="buildTag" class="muted">· build 2026-05-28f</span>
+        <span id="buildTag" class="muted">· build 2026-05-28g</span>
       </span>
     </footer>
 

@@ -1,5 +1,11 @@
 import * as THREE from "three";
 import { STLLoader } from "three/addons/loaders/STLLoader.js";
+import {
+  QUALITY,
+  autoQuality,
+  simplifyGeometry,
+  dedupeGeometries,
+} from "./optimize.js";
 import { OBJLoader } from "three/addons/loaders/OBJLoader.js";
 
 // Returns { object: THREE.Object3D, units: 'mm'|'in'|'cm'|'m'|'unknown' }
@@ -27,10 +33,13 @@ const yieldUI = () => new Promise((r) => setTimeout(r, 0));
 // integrated GPU has 1-2 GB usable VRAM via WebGL, and we want to leave
 // headroom for shading and the ghost-outline buffer.
 export const SAFETY = {
-  WARN_TRIANGLES: 600_000,
-  REFUSE_TRIANGLES: 4_000_000,
-  WARN_UNCOMPRESSED_MB: 200,
-  REFUSE_UNCOMPRESSED_MB: 800,
+  // Soft thresholds: we still warn so the user knows when their upload is
+  // large, but we no longer refuse. The Quality preset + auto-simplifier
+  // brings the actual GPU footprint down before we render.
+  WARN_TRIANGLES: 1_500_000,
+  REFUSE_TRIANGLES: 80_000_000, // truly absurd; basically only to stop infinite loops
+  WARN_UNCOMPRESSED_MB: 400,
+  REFUSE_UNCOMPRESSED_MB: 3000,
 };
 
 // Cancellation token shared with main.js. Each user-initiated load
@@ -51,7 +60,10 @@ const checkCancel = (token) => {
   if (parserCancel.id !== token) throw new ParseCancelled();
 };
 
-export async function parseCadFile(file, { onProgress, unitHint } = {}) {
+export async function parseCadFile(
+  file,
+  { onProgress, unitHint, quality = "auto" } = {},
+) {
   const token = parserCancel.id;
   const t0 = performance.now();
   const name = file.name.toLowerCase();
@@ -89,7 +101,7 @@ export async function parseCadFile(file, { onProgress, unitHint } = {}) {
   } else if (ext === "zip") {
     report("Reading ZIP archive");
     await yieldUI();
-    const inner = await parseZip(file, report, unitHint);
+    const inner = await parseZip(file, report, unitHint, quality);
     assembly = inner.assembly;
     if (detectedUnits === "unknown") detectedUnits = inner.units;
   } else {
@@ -642,7 +654,7 @@ async function loadFflate() {
   return fflatePromise;
 }
 
-async function parseZip(file, report, unitHint) {
+async function parseZip(file, report, unitHint, quality = "auto") {
   const token = parserCancel.id;
   const fflate = await loadFflate();
   const buffer = new Uint8Array(await file.arrayBuffer());
@@ -664,65 +676,57 @@ async function parseZip(file, report, unitHint) {
     throw new Error("ZIP did not contain any STL/OBJ/STEP files");
   }
 
-  // Pre-flight safety: sum uncompressed bytes and (for binary STL members)
-  // exact triangle counts. We can read each STL's triangle count without
-  // decoding the geometry, so this is O(member count), not O(geometry).
+  // Pre-flight: sum uncompressed bytes and (for binary STL members) exact
+  // triangle counts. Used to pick the Quality preset when the caller said
+  // "auto", and to show the user what's about to load.
   let totalUncompressed = 0;
   let estimatedTris = 0;
   for (const name of members) {
     const b = entries[name];
     totalUncompressed += b.byteLength;
-    // Binary STL: triangle count at byte offset 80
     if (b.byteLength >= 84) {
-      // Skip ASCII members; we'll count them on the fly.
       const headByte = b[0];
-      if (headByte !== 0x73 /* 's' */ && headByte !== 0x20 /* space */) {
-        estimatedTris += new DataView(b.buffer, b.byteOffset, 84).getUint32(80, true);
+      if (headByte !== 0x73 && headByte !== 0x20) {
+        estimatedTris += new DataView(b.buffer, b.byteOffset, 84).getUint32(
+          80,
+          true,
+        );
       }
     }
   }
   const uncompressedMB = totalUncompressed / (1024 * 1024);
+  const chosenKey =
+    quality === "auto" ? autoQuality(members.length, estimatedTris) : quality;
+  const preset = QUALITY[chosenKey] || QUALITY.medium;
   report(
-    `Archive has ${members.length} CAD file(s) · ${uncompressedMB.toFixed(1)} MB · ≈${estimatedTris.toLocaleString()} triangles`,
+    `Archive has ${members.length} CAD file(s) · ${uncompressedMB.toFixed(1)} MB · ≈${estimatedTris.toLocaleString()} triangles · quality: ${preset.label}`,
   );
   await yieldUI();
   checkCancel(token);
 
-  // Hard refuse anything that's certain to exhaust the GPU or browser memory.
-  if (
-    uncompressedMB > SAFETY.REFUSE_UNCOMPRESSED_MB ||
-    estimatedTris > SAFETY.REFUSE_TRIANGLES
-  ) {
+  if (uncompressedMB > SAFETY.REFUSE_UNCOMPRESSED_MB ||
+      estimatedTris > SAFETY.REFUSE_TRIANGLES) {
     throw new Error(
-      `Archive is too large for safe in-browser rendering (${uncompressedMB.toFixed(0)} MB / ` +
-        `${estimatedTris.toLocaleString()} triangles). The cap is ` +
-        `${SAFETY.REFUSE_UNCOMPRESSED_MB} MB / ${SAFETY.REFUSE_TRIANGLES.toLocaleString()} triangles ` +
-        `to protect the GPU driver. Re-export with a coarser STL resolution (in Onshape: ` +
-        `Download → STL → Resolution: Coarse), or export only the subassembly you need.`,
+      `Archive is too large to load in-browser (${uncompressedMB.toFixed(0)} MB / ` +
+        `${estimatedTris.toLocaleString()} triangles). Re-export only the subassembly you need.`,
     );
   }
-  if (
-    uncompressedMB > SAFETY.WARN_UNCOMPRESSED_MB ||
-    estimatedTris > SAFETY.WARN_TRIANGLES
-  ) {
+  if (uncompressedMB > SAFETY.WARN_UNCOMPRESSED_MB ||
+      estimatedTris > SAFETY.WARN_TRIANGLES) {
     report(
-      `Heads up: ${uncompressedMB.toFixed(0)} MB / ${estimatedTris.toLocaleString()} triangles — ` +
-        `loading may be slow. Use the Cancel button if it hangs.`,
+      `Heads up: ${uncompressedMB.toFixed(0)} MB / ${estimatedTris.toLocaleString()} triangles — using ${preset.label} quality to keep the GPU happy. Use Cancel if it hangs.`,
     );
     await yieldUI();
   }
 
   const assembly = new THREE.Group();
   let units = "unknown";
-
-  // Fast path: every member is a single-part STL (Onshape's "one file per
-  // part" export). Decode each STL's geometry directly into one mesh per
-  // member with no splitting or vertex merging.
   const allStl = members.every((n) => /\.stl$/i.test(n));
 
   if (allStl) {
     const t0 = performance.now();
-    let totalTri = 0;
+    let rawTri = 0;
+    let keptTri = 0;
     const step = Math.max(1, Math.floor(members.length / 12));
     for (let i = 0; i < members.length; i++) {
       const memberName = members[i];
@@ -731,26 +735,50 @@ async function parseZip(file, report, unitHint) {
         memberBytes,
         memberName,
       );
+      rawTri += triangles;
+
+      // Simplify per-part if this part is denser than the quality preset
+      // allows. Vertex clustering shrinks the geometry in place.
+      if (
+        preset.cluster !== Infinity &&
+        (triangles > preset.perPart || triangles > 800)
+      ) {
+        const simpler = simplifyGeometry(mesh.geometry, preset.cluster);
+        if (simpler !== mesh.geometry) {
+          mesh.geometry.dispose();
+          mesh.geometry = simpler;
+        }
+      }
+      const finalTris =
+        (mesh.geometry.getIndex()?.count ??
+          mesh.geometry.getAttribute("position").count) / 3;
+      keptTri += finalTris;
       assembly.add(mesh);
-      totalTri += triangles;
+
       if (i % step === 0 || i === members.length - 1) {
         const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+        const ratio = rawTri > 0 ? Math.round((1 - keptTri / rawTri) * 100) : 0;
         report(
-          `Parsing parts · ${i + 1} / ${members.length} · ${totalTri.toLocaleString()} triangles · ${elapsed}s`,
+          `Parsing parts · ${i + 1} / ${members.length} · ${keptTri.toLocaleString()} kept / ${rawTri.toLocaleString()} raw tris (-${ratio}%) · ${elapsed}s`,
         );
         await yieldUI();
         checkCancel(token);
-        // If triangle count balloons past the hard cap mid-parse (e.g. lots
-        // of ASCII STL members we couldn't pre-count), bail before we crash
-        // the GPU on the next allocation.
-        if (totalTri > SAFETY.REFUSE_TRIANGLES) {
-          throw new Error(
-            `Triangle count passed ${SAFETY.REFUSE_TRIANGLES.toLocaleString()} mid-parse — aborting to protect the GPU. ` +
-              `Re-export with a coarser STL resolution.`,
-          );
-        }
       }
     }
+
+    // Dedupe identical-shape parts so the GPU only stores one copy of each
+    // (a typical VEX assembly has many duplicates: screws, standoffs,
+    // c-channels...).
+    report("Deduplicating identical parts");
+    await yieldUI();
+    checkCancel(token);
+    const meshes = [];
+    assembly.traverse((c) => { if (c.isMesh) meshes.push(c); });
+    const stats = dedupeGeometries(meshes);
+    report(
+      `Deduplicated · ${stats.totalCount} parts → ${stats.uniqueCount} unique geometries (saved ${stats.savedTris.toLocaleString()} duplicate triangles)`,
+    );
+    await yieldUI();
   } else {
     // Mixed-format ZIP (e.g. a mix of STEP and STL): fall back to the full
     // parser per member.

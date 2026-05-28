@@ -30,6 +30,7 @@ const els = {
   openRoboBtn: document.getElementById("openRoboBtn"),
   exportBtn: document.getElementById("exportBtn"),
   unitsSelect: document.getElementById("unitsSelect"),
+  qualitySelect: document.getElementById("qualitySelect"),
   selectionInfo: document.getElementById("selectionInfo"),
   selName: document.getElementById("selName"),
   selMeta: document.getElementById("selMeta"),
@@ -141,34 +142,20 @@ async function loadFile(file) {
   // cancel it before starting the new one.
   cancelParse();
 
-  // Refuse / warn about files that are very likely to exhaust browser memory
-  // before we even start. STEP tessellation in WASM needs ~5–10x the file
-  // size in RAM, so we warn at 50 MB and hard-refuse at 200 MB.
+  // STEP files still need a soft prompt above ~50 MB because WASM
+  // tessellation has its own memory budget unrelated to rendering.
+  // For STL / ZIP we let the parser's auto-simplifier handle any size:
+  // the Quality preset keeps GPU usage bounded regardless of part count.
   const sizeMB = file.size / (1024 * 1024);
   const ext = file.name.toLowerCase().split(".").pop();
-  if (ext === "step" || ext === "stp") {
-    if (sizeMB > 200) {
-      showToast(
-        `STEP file is ${sizeMB.toFixed(0)} MB — too large for in-browser tessellation. Export as STL from your CAD program and try again.`,
-        { error: true, duration: 8000 },
-      );
-      return;
-    }
-    if (sizeMB > 50) {
-      const ok = window.confirm(
-        `This STEP file is ${sizeMB.toFixed(0)} MB.\n\n` +
-          "STEP files need to be tessellated in the browser, which can take " +
-          "several minutes and may run the tab out of memory above ~50 MB.\n\n" +
-          "For files this large, the recommended workflow is:\n" +
-          "  • Export your CAD as STL\n" +
-          "  • Then drop the STL here\n\n" +
-          "Click OK to attempt to parse the STEP anyway, or Cancel and export STL.",
-      );
-      if (!ok) return;
-    }
-  } else if (sizeMB > 300) {
+  if ((ext === "step" || ext === "stp") && sizeMB > 50) {
     const ok = window.confirm(
-      `This ${ext.toUpperCase()} file is ${sizeMB.toFixed(0)} MB. Parsing may run the tab out of memory. Continue anyway?`,
+      `This STEP file is ${sizeMB.toFixed(0)} MB.\n\n` +
+        "STEP tessellation runs in a WASM worker and gets slow above ~50 MB. " +
+        "For big assemblies, prefer exporting as a ZIP of STL files (Onshape: " +
+        "Download → STL → Group into one file: No), then drop the ZIP here — " +
+        "that path auto-simplifies and dedupes parts.\n\n" +
+        "Click OK to try the STEP anyway, or Cancel.",
     );
     if (!ok) return;
   }
@@ -177,8 +164,10 @@ async function loadFile(file) {
   showLoading("Loading…", `Reading ${file.name}`);
   try {
     const unitHint = els.unitsSelect.value;
+    const quality = els.qualitySelect?.value || "auto";
     const { object, units } = await parseCadFile(file, {
       unitHint,
+      quality,
       onProgress: (msg) => {
         if (myToken !== currentLoadToken) return;
         els.loadingMsg.textContent = "Working…";
