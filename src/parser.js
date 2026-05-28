@@ -53,8 +53,16 @@ export async function parseCadFile(file, { onProgress, unitHint } = {}) {
     await yieldUI();
     assembly = await parseStepFile(file, report);
     if (detectedUnits === "unknown") detectedUnits = "mm";
+  } else if (ext === "zip") {
+    report("Reading ZIP archive");
+    await yieldUI();
+    const inner = await parseZip(file, report, unitHint);
+    assembly = inner.assembly;
+    if (detectedUnits === "unknown") detectedUnits = inner.units;
   } else {
-    throw new Error(`Unsupported file type ".${ext}". Use STL, OBJ, or STEP.`);
+    throw new Error(
+      `Unsupported file type ".${ext}". Use STL, OBJ, STEP, or a ZIP that contains them.`,
+    );
   }
 
   if (!assembly || assembly.children.length === 0) {
@@ -583,4 +591,71 @@ async function parseStepFile(file, report) {
     }
   }
   return assembly;
+}
+
+// ---------- ZIP archive parsing ----------
+//
+// Onshape's "Download → Other formats → STL (one file per part)" emits a ZIP
+// containing one STL per component. We open the archive on the fly with
+// fflate (a tiny ESM library loaded from a CDN), parse each member through
+// the appropriate loader, and merge the resulting parts into one assembly.
+
+let fflatePromise = null;
+async function loadFflate() {
+  if (fflatePromise) return fflatePromise;
+  fflatePromise = import(
+    /* @vite-ignore */ "https://cdn.jsdelivr.net/npm/fflate@0.8.2/esm/browser.js"
+  );
+  return fflatePromise;
+}
+
+async function parseZip(file, report, unitHint) {
+  const fflate = await loadFflate();
+  const buffer = new Uint8Array(await file.arrayBuffer());
+  report("Unzipping archive");
+  await yieldUI();
+  const entries = await new Promise((resolve, reject) => {
+    fflate.unzip(buffer, (err, unzipped) => {
+      if (err) reject(err);
+      else resolve(unzipped);
+    });
+  });
+
+  const supported = (name) =>
+    /\.(stl|obj|step|stp)$/i.test(name) && !name.startsWith("__MACOSX/");
+  const members = Object.keys(entries).filter(supported);
+  report(`Archive has ${members.length} CAD file(s)`);
+  await yieldUI();
+
+  if (members.length === 0) {
+    throw new Error("ZIP did not contain any STL/OBJ/STEP files");
+  }
+
+  const assembly = new THREE.Group();
+  let units = "unknown";
+  for (let i = 0; i < members.length; i++) {
+    const memberName = members[i];
+    const memberBytes = entries[memberName];
+    report(`Parsing ${memberName} (${i + 1} / ${members.length})`);
+    await yieldUI();
+    // Wrap the inner bytes in a File so parseCadFile / parseStl can consume
+    // them with the same interface as a real upload.
+    const innerFile = new File([memberBytes], memberName, {
+      type: "application/octet-stream",
+    });
+    const inner = await parseCadFile(innerFile, {
+      onProgress: (m) => report(`${memberName}: ${m}`),
+      unitHint,
+    });
+    if (units === "unknown") units = inner.units;
+    inner.object.traverse((c) => {
+      if (c.isMesh && !c.userData.sourceName) {
+        c.userData.sourceName = memberName.replace(/\.[^.]+$/, "");
+      }
+    });
+    while (inner.object.children.length) {
+      assembly.add(inner.object.children[0]);
+    }
+  }
+  return { assembly, units };
 }

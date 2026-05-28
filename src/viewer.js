@@ -132,12 +132,20 @@ export class Viewer {
     this.categoryColors = categoryColors;
     this.assembly = assembly;
 
+    let meshCount = 0;
+    assembly.traverse((c) => { if (c.isMesh) meshCount++; });
+    console.log(`[viewer] loadAssembly: ${meshCount} mesh(es)`);
+
     // Normalize: recenter on origin and scale so the longest dim is ~10 units.
     const box = new THREE.Box3().setFromObject(assembly);
     const size = box.getSize(new THREE.Vector3());
     const center = box.getCenter(new THREE.Vector3());
     const maxDim = Math.max(size.x, size.y, size.z) || 1;
     const scale = 10 / maxDim;
+    console.log(
+      `[viewer] raw extents: ${size.x.toFixed(3)} x ${size.y.toFixed(3)} x ${size.z.toFixed(3)} ` +
+        `· view scale: ${scale.toFixed(4)} (longest dim -> 10 units)`,
+    );
     assembly.position.sub(center.multiplyScalar(scale));
     assembly.scale.setScalar(scale);
     this.viewScale = scale;
@@ -184,12 +192,12 @@ export class Viewer {
     // Prefer the source CAD color if the parser stored one.
     if (mesh.userData.sourceColor) return mesh.userData.sourceColor;
     // Otherwise, deterministic golden-angle hue palette so adjacent parts get
-    // visually distinct colors. We avoid pure saturated colors so the model
-    // looks like rendered metal/plastic, not a candy box.
+    // visually distinct colors. Bright enough to read against the dark scene
+    // background without looking like a candy box.
     const golden = 0.61803398875;
     const hue = (index * golden) % 1;
-    const sat = 0.18 + ((index * 7) % 10) * 0.02; // 0.18..0.36
-    const lit = 0.55 + ((index * 5) % 7) * 0.02; // 0.55..0.67
+    const sat = 0.45 + ((index * 7) % 10) * 0.025; // 0.45..0.70
+    const lit = 0.62 + ((index * 5) % 7) * 0.025; // 0.62..0.77
     return new THREE.Color().setHSL(hue, sat, lit).getHex();
   }
 
@@ -318,14 +326,16 @@ export class Viewer {
     if (!this.ghostGroup) return;
     if (this.ghostUserPref === true) {
       this.ghostGroup.visible = true;
-      this._setGhostOpacity(0.45);
+      this._setGhostOpacity(0.55);
     } else if (this.ghostUserPref === false) {
       this.ghostGroup.visible = false;
     } else {
-      // Auto: invisible while assembled, fade in as we explode.
+      // Auto: faint baseline outline while assembled (so the user always sees
+      // the model, even if the lighting/material would otherwise leave it
+      // looking flat), brightening as the explode amount grows.
       const a = this.explodeAmount;
-      this.ghostGroup.visible = a > 0.01;
-      this._setGhostOpacity(0.05 + a * 0.45);
+      this.ghostGroup.visible = true;
+      this._setGhostOpacity(0.12 + a * 0.40);
     }
   }
 

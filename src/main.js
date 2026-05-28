@@ -227,7 +227,19 @@ async function loadFile(file) {
     els.explodeRange.value = "0";
     setExplodeButtonLabel(false);
     hideLoading();
-    showToast(`Loaded ${classification.items.length} unique parts`);
+
+    const items = classification.items;
+    const identified = items.filter((i) => i.part).length;
+    if (items.length === 1 && identified === 0) {
+      showToast(
+        "Loaded as a single unidentified part — for best classification, upload the whole assembly. From Onshape, use Download → STL → \"Group into one file: No\" (a ZIP), or export an assembly STEP.",
+        { duration: 9000 },
+      );
+    } else {
+      showToast(
+        `Loaded ${items.length} unique part${items.length === 1 ? "" : "s"} · ${identified} identified`,
+      );
+    }
   } catch (err) {
     console.error(err);
     hideLoading();
