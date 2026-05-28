@@ -18,6 +18,8 @@ const els = {
   partCount: document.getElementById("partCountLabel"),
   bbox: document.getElementById("bboxLabel"),
   ghostToggle: document.getElementById("ghostToggle"),
+  colorNaturalRadio: document.getElementById("colorNatural"),
+  colorCategoryRadio: document.getElementById("colorCategory"),
   wireToggle: document.getElementById("wireToggle"),
   rotateToggle: document.getElementById("autoRotateToggle"),
   explodeRange: document.getElementById("explodeRange"),
@@ -255,9 +257,19 @@ function boundingBoxString(object, units) {
 }
 
 // ---------- HUD interactions ----------
-els.ghostToggle.addEventListener("change", () =>
-  viewer?.setGhostVisible(els.ghostToggle.checked),
-);
+els.ghostToggle.addEventListener("change", () => {
+  // Unchecked = automatic (fades in as explode increases); checked =
+  // force always-visible. We never use a hard "hide" because the auto
+  // mode already keeps it invisible while assembled.
+  viewer?.setGhostVisible(els.ghostToggle.checked ? true : null);
+});
+
+els.colorNaturalRadio?.addEventListener("change", () => {
+  if (els.colorNaturalRadio.checked) viewer?.setColorMode("natural");
+});
+els.colorCategoryRadio?.addEventListener("change", () => {
+  if (els.colorCategoryRadio.checked) viewer?.setColorMode("category");
+});
 els.wireToggle.addEventListener("change", () =>
   viewer?.setWireframe(els.wireToggle.checked),
 );

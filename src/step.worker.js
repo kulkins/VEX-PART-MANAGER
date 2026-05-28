@@ -63,6 +63,9 @@ self.onmessage = async (event) => {
       const idx = m.index ? new Uint32Array(m.index.array) : null;
       meshes.push({
         name: m.name || null,
+        // occt-import-js exposes per-mesh color as [r,g,b] in 0..1 when the
+        // STEP file embeds material colours (most exporters do).
+        color: m.color || null,
         position: pos,
         normal: norm,
         index: idx,

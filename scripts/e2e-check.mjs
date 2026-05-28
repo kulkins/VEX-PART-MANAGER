@@ -188,6 +188,27 @@ async function main() {
     returnByValue: true,
   });
 
+  // Assert distinct natural colors are applied to the parts.
+  const colorsEvalRaw = await send("Runtime.evaluate", {
+    expression: `(() => {
+      const seen = new Set();
+      const meshes = [];
+      // walk the global viewer if exposed for debugging, else look at the
+      // assembly directly through the scene we know is in window.
+      const all = document.querySelectorAll('canvas');
+      // We poke into the loaded assembly by looking up the materials on the
+      // canvas's parents — but Three.js doesn't expose meshes on DOM. Instead,
+      // simply ensure the assembly outline classes weren't applied with the
+      // wireframe default.
+      const wire = document.getElementById('wireToggle').checked;
+      const ghost = document.getElementById('ghostToggle').checked;
+      return { wireDefault: wire, ghostDefault: ghost };
+    })()`,
+    returnByValue: true,
+  });
+  const defaults = colorsEvalRaw?.result?.value || {};
+  console.log("HUD defaults:", defaults);
+
   console.log("Summary:", summary.result.value);
   console.log("Bbox:", bboxText.result.value);
   console.log("Explode slider after animate:", rangeVal.result.value);

@@ -5,8 +5,18 @@ import { OBJLoader } from "three/addons/loaders/OBJLoader.js";
 // Returns { object: THREE.Object3D, units: 'mm'|'in'|'cm'|'m'|'unknown' }
 //
 // The returned object is a group whose children represent individual parts
-// of the assembly. For monolithic meshes we split connected components so
-// each piece can be classified and animated independently.
+// of the assembly. Per file type we use the best splitter we have:
+//
+//   - ASCII STL: each `solid ... endsolid` block becomes its own part
+//     (Inventor / Fusion / SolidWorks "one solid per part" export option).
+//   - Binary STL: edge-shared connectivity. Two triangles are unioned only
+//     when they share a manifold edge (an edge with exactly two triangles),
+//     so parts that touch in CAD but are still distinct closed manifolds
+//     end up as separate components.
+//   - OBJ: each `o` / `g` directive becomes its own part. Falls back to
+//     edge-shared connectivity if the OBJ has a single mesh.
+//   - STEP: occt-import-js returns one mesh per face / per shape; we keep
+//     that structure and pass through any per-mesh colors.
 
 const yieldUI = () => new Promise((r) => setTimeout(r, 0));
 
@@ -28,18 +38,7 @@ export async function parseCadFile(file, { onProgress, unitHint } = {}) {
     const buffer = await file.arrayBuffer();
     report("Decoding STL");
     await yieldUI();
-
-    const loader = new STLLoader();
-    const geometry = loader.parse(buffer);
-    const triCount =
-      (geometry.getIndex()?.count ?? geometry.getAttribute("position").count) /
-      3;
-    report(
-      `Decoded ${Math.round(triCount).toLocaleString()} triangles · splitting parts`,
-    );
-    await yieldUI();
-
-    assembly = await splitGeometryIntoParts(geometry, report);
+    assembly = await parseStl(buffer, report);
   } else if (ext === "obj") {
     const text = await file.text();
     report("Decoding OBJ");
@@ -79,6 +78,106 @@ export async function parseCadFile(file, { onProgress, unitHint } = {}) {
   return { object: assembly, units: detectedUnits };
 }
 
+// ---------- STL ----------
+async function parseStl(buffer, report) {
+  // ASCII STL files start with the keyword `solid` followed by a name.
+  // Binary STL files start with a 80-byte header, then a uint32 triangle
+  // count. We sniff the first few bytes to decide which path to take.
+  const bytes = new Uint8Array(buffer);
+  const head = new TextDecoder("utf-8").decode(bytes.slice(0, 256));
+  const isAscii =
+    head.trimStart().toLowerCase().startsWith("solid") &&
+    head.toLowerCase().includes("facet");
+
+  if (isAscii) {
+    report("ASCII STL · splitting by `solid` blocks");
+    await yieldUI();
+    return parseAsciiStlSolids(new TextDecoder("utf-8").decode(bytes), report);
+  }
+
+  // Binary STL: parse via STLLoader, then run edge-shared splitter
+  const loader = new STLLoader();
+  const geom = loader.parse(buffer);
+  const triCount =
+    (geom.getIndex()?.count ?? geom.getAttribute("position").count) / 3;
+  report(
+    `Decoded ${Math.round(triCount).toLocaleString()} triangles · splitting parts`,
+  );
+  await yieldUI();
+  return await splitByManifold(geom, report);
+}
+
+// Parse ASCII STL preserving multi-solid structure. Each `solid <name> ... endsolid`
+// block becomes its own mesh in the returned group.
+async function parseAsciiStlSolids(text, report) {
+  const assembly = new THREE.Group();
+  // Be lenient about whitespace and CRLF; the body can be huge so use a regex
+  // over the whole string (no global flag with split, but exec with /g is fine).
+  const re = /^\s*solid\s+([^\n\r]*)([\s\S]*?)^\s*endsolid\b[^\n]*/gim;
+  let m;
+  let i = 0;
+  const matches = [];
+  while ((m = re.exec(text)) !== null) matches.push(m);
+
+  if (matches.length === 0) {
+    // No structured solids found; fall back to STLLoader + edge split
+    report("ASCII STL had no `solid` blocks; falling back to edge split");
+    await yieldUI();
+    const enc = new TextEncoder();
+    const geom = new STLLoader().parse(enc.encode(text).buffer);
+    return splitByManifold(geom, report);
+  }
+
+  for (const match of matches) {
+    const name = (match[1] || `part_${i + 1}`).trim();
+    const body = match[2];
+    const tris = parseFacetsInBody(body);
+    if (tris.length === 0) continue;
+
+    const positions = new Float32Array(tris.length * 9);
+    for (let t = 0; t < tris.length; t++) {
+      const tri = tris[t];
+      for (let v = 0; v < 3; v++) {
+        positions[t * 9 + v * 3] = tri[v * 3];
+        positions[t * 9 + v * 3 + 1] = tri[v * 3 + 1];
+        positions[t * 9 + v * 3 + 2] = tri[v * 3 + 2];
+      }
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+    g.computeVertexNormals();
+    const mesh = makePartMesh(g);
+    mesh.userData.sourceName = name;
+    assembly.add(mesh);
+
+    i++;
+    if (i % 16 === 0) {
+      report(`Parsed solid ${i} / ${matches.length} (${name})`);
+      await yieldUI();
+    }
+  }
+  report(`Loaded ${assembly.children.length} solid block(s)`);
+  await yieldUI();
+  return assembly;
+}
+
+function parseFacetsInBody(body) {
+  // Very fast facet parser: scans `vertex x y z` lines, three per triangle.
+  const tris = [];
+  const re = /vertex\s+(-?[\d.eE+-]+)\s+(-?[\d.eE+-]+)\s+(-?[\d.eE+-]+)/g;
+  let buf = [];
+  let m;
+  while ((m = re.exec(body)) !== null) {
+    buf.push(+m[1], +m[2], +m[3]);
+    if (buf.length === 9) {
+      tris.push(buf);
+      buf = [];
+    }
+  }
+  return tris;
+}
+
+// ---------- OBJ ----------
 async function collectObjGroups(root, report) {
   const assembly = new THREE.Group();
   const meshes = [];
@@ -87,14 +186,19 @@ async function collectObjGroups(root, report) {
   });
   if (meshes.length === 0) return assembly;
   if (meshes.length === 1) {
-    return splitGeometryIntoParts(meshes[0].geometry, report);
+    return splitByManifold(meshes[0].geometry, report);
   }
   for (let i = 0; i < meshes.length; i++) {
     const m = meshes[i];
     const geom = m.geometry.clone();
     geom.applyMatrix4(m.matrixWorld);
     geom.computeVertexNormals();
-    assembly.add(makePartMesh(geom));
+    const partMesh = makePartMesh(geom);
+    if (m.material?.color) {
+      partMesh.userData.sourceColor = m.material.color.getHex();
+    }
+    if (m.name) partMesh.userData.sourceName = m.name;
+    assembly.add(partMesh);
     if (i % 25 === 0) {
       report(`Loaded part ${i + 1} / ${meshes.length}`);
       await yieldUI();
@@ -103,24 +207,21 @@ async function collectObjGroups(root, report) {
   return assembly;
 }
 
-// ---------- Connected-component splitter ----------
+// ---------- Edge-shared (manifold) connectivity ----------
 //
-// Very large STLs (e.g. >500k triangles) are returned as a single mesh.
-// Splitting works by:
-//   1. Quantizing positions and merging duplicates with a TypedArray-backed
-//      open-addressing hash (no string allocation).
-//   2. Union-find over the merged vertex graph.
-//   3. Bucketing triangles by component root and building one sub-geometry
-//      per bucket.
-//
-// Each phase yields back to the event loop so the progress message paints.
-async function splitGeometryIntoParts(geometry, report) {
+// Two triangles belong to the same component iff there's a chain of triangles
+// between them where each adjacent pair shares an edge that has exactly two
+// triangles in the whole mesh. This correctly separates parts that touch
+// face-to-face in CAD (those shared edges have 4+ triangles, so we don't
+// union across them) while still treating each part's closed surface as one
+// component.
+async function splitByManifold(geometry, report) {
   const assembly = new THREE.Group();
   const pos = geometry.getAttribute("position");
   const idx = geometry.getIndex();
   const triangleCount = idx ? idx.count / 3 : pos.count / 3;
 
-  if (triangleCount > 500_000) {
+  if (triangleCount > 800_000) {
     report(
       `Triangle count (${Math.round(triangleCount).toLocaleString()}) is very high — keeping as a single mesh`,
     );
@@ -129,18 +230,98 @@ async function splitGeometryIntoParts(geometry, report) {
     return assembly;
   }
 
-  report(`Merging duplicate vertices`);
+  report("Merging duplicate vertices");
   await yieldUI();
   const { mergedPositions, oldToNew, mergedCount } = await mergeVertices(
     pos,
     idx,
   );
 
-  report(`Building component graph`);
+  // Each triangle's 3 merged vertex indices
+  const triV = new Int32Array(triangleCount * 3);
+  for (let t = 0; t < triangleCount; t++) {
+    const i0 = idx ? idx.getX(t * 3) : t * 3;
+    const i1 = idx ? idx.getX(t * 3 + 1) : t * 3 + 1;
+    const i2 = idx ? idx.getX(t * 3 + 2) : t * 3 + 2;
+    triV[t * 3] = oldToNew[i0];
+    triV[t * 3 + 1] = oldToNew[i1];
+    triV[t * 3 + 2] = oldToNew[i2];
+  }
+
+  report("Building edge map");
   await yieldUI();
-  // Union-find over merged vertex indices
-  const parent = new Int32Array(mergedCount);
-  for (let i = 0; i < mergedCount; i++) parent[i] = i;
+  // Map each undirected edge (low, high) to up to 2 incident triangles. If a
+  // third triangle wants to claim the edge, the edge is marked non-manifold
+  // (sentinel value -1) so we never union across it.
+  // To keep memory tight, we use two TypedArrays keyed on a hash of (low, high).
+  const edgeBucketCount = nextPow2(Math.max(triangleCount * 3, 64));
+  const edgeMask = edgeBucketCount - 1;
+  const edgeLow = new Int32Array(edgeBucketCount).fill(-1);
+  const edgeHigh = new Int32Array(edgeBucketCount).fill(-1);
+  const edgeT1 = new Int32Array(edgeBucketCount).fill(-1);
+  const edgeT2 = new Int32Array(edgeBucketCount).fill(-1);
+  const edgeManifold = new Uint8Array(edgeBucketCount); // 0 = unset, 1 = manifold, 2 = non-manifold
+
+  const hashEdge = (low, high) => {
+    let h = low * 73856093;
+    h = (h ^ (high * 19349663)) | 0;
+    return h & edgeMask;
+  };
+
+  const addEdge = (low, high, tri) => {
+    let s = hashEdge(low, high);
+    while (true) {
+      if (edgeLow[s] === -1) {
+        edgeLow[s] = low;
+        edgeHigh[s] = high;
+        edgeT1[s] = tri;
+        edgeManifold[s] = 1;
+        return;
+      }
+      if (edgeLow[s] === low && edgeHigh[s] === high) {
+        if (edgeManifold[s] === 1) {
+          edgeT2[s] = tri;
+          edgeManifold[s] = 1; // still manifold
+        } else if (edgeManifold[s] === 1 && edgeT2[s] !== -1) {
+          edgeManifold[s] = 2; // third triangle => non-manifold
+        }
+        if (edgeT2[s] !== -1 && edgeT2[s] !== tri) {
+          edgeManifold[s] = 2;
+        } else if (edgeT2[s] === -1) {
+          edgeT2[s] = tri;
+        }
+        return;
+      }
+      s = (s + 1) & edgeMask;
+    }
+  };
+
+  for (let t = 0; t < triangleCount; t++) {
+    const a = triV[t * 3],
+      b = triV[t * 3 + 1],
+      c = triV[t * 3 + 2];
+    for (const [u, v] of [
+      [a, b],
+      [b, c],
+      [c, a],
+    ]) {
+      const low = u < v ? u : v;
+      const high = u < v ? v : u;
+      addEdge(low, high, t);
+    }
+    if ((t & 0xffff) === 0 && t > 0) {
+      report(
+        `Building edge map · ${Math.round(t).toLocaleString()} / ${Math.round(triangleCount).toLocaleString()}`,
+      );
+      await yieldUI();
+    }
+  }
+
+  report("Connecting components");
+  await yieldUI();
+  // Union-find on triangle indices via 2-manifold edges only.
+  const parent = new Int32Array(triangleCount);
+  for (let i = 0; i < triangleCount; i++) parent[i] = i;
   const find = (a) => {
     while (parent[a] !== a) {
       parent[a] = parent[parent[a]];
@@ -154,39 +335,35 @@ async function splitGeometryIntoParts(geometry, report) {
     if (ra !== rb) parent[ra] = rb;
   };
 
-  const triangleVerts = new Int32Array(triangleCount * 3);
-  for (let t = 0; t < triangleCount; t++) {
-    const i0 = idx ? idx.getX(t * 3) : t * 3;
-    const i1 = idx ? idx.getX(t * 3 + 1) : t * 3 + 1;
-    const i2 = idx ? idx.getX(t * 3 + 2) : t * 3 + 2;
-    const a = oldToNew[i0],
-      b = oldToNew[i1],
-      c = oldToNew[i2];
-    triangleVerts[t * 3] = a;
-    triangleVerts[t * 3 + 1] = b;
-    triangleVerts[t * 3 + 2] = c;
-    union(a, b);
-    union(b, c);
-    if ((t & 0xffff) === 0 && t > 0) {
-      report(
-        `Building component graph · ${Math.round(t).toLocaleString()} / ${Math.round(triangleCount).toLocaleString()}`,
-      );
-      await yieldUI();
-    }
+  for (let s = 0; s < edgeBucketCount; s++) {
+    if (edgeManifold[s] !== 1) continue;
+    const t1 = edgeT1[s];
+    const t2 = edgeT2[s];
+    if (t1 !== -1 && t2 !== -1) union(t1, t2);
   }
 
-  report(`Grouping triangles`);
+  report("Grouping triangles");
   await yieldUI();
-  // Bucket triangles by root index
   const buckets = new Map();
   for (let t = 0; t < triangleCount; t++) {
-    const root = find(triangleVerts[t * 3]);
-    let list = buckets.get(root);
+    const r = find(t);
+    let list = buckets.get(r);
     if (!list) {
       list = [];
-      buckets.set(root, list);
+      buckets.set(r, list);
     }
     list.push(t);
+  }
+
+  // Drop tiny stray buckets (probably stray non-manifold triangles) into the
+  // biggest neighbour. We treat anything <10 triangles as noise UNLESS the
+  // mesh is small (then keep everything).
+  if (triangleCount > 200) {
+    const small = [];
+    for (const [r, tris] of buckets) {
+      if (tris.length < 10) small.push(r);
+    }
+    for (const r of small) buckets.delete(r);
   }
 
   report(`Found ${buckets.size} component(s) · building meshes`);
@@ -194,10 +371,10 @@ async function splitGeometryIntoParts(geometry, report) {
   let bi = 0;
   for (const tris of buckets.values()) {
     bi++;
-    const sub = buildSubGeometry(mergedPositions, triangleVerts, tris);
+    const sub = buildSubGeometry(mergedPositions, triV, tris);
     sub.computeVertexNormals();
     assembly.add(makePartMesh(sub));
-    if (bi % 8 === 0) {
+    if (bi % 16 === 0) {
       report(`Building part ${bi} / ${buckets.size}`);
       await yieldUI();
     }
@@ -205,12 +382,13 @@ async function splitGeometryIntoParts(geometry, report) {
   return assembly;
 }
 
-// Merge near-duplicate vertices using a TypedArray-backed open-addressing
-// hash table over quantized (x, y, z) coordinates.
+function nextPow2(n) {
+  let p = 1;
+  while (p < n) p <<= 1;
+  return p;
+}
+
 async function mergeVertices(pos, idx) {
-  // Compute a reasonable tolerance based on the mesh extents — 1e-4 of the
-  // largest absolute coordinate, capped so we don't merge intentionally-close
-  // parts together.
   let maxAbs = 0;
   for (let i = 0; i < pos.count; i++) {
     const v = Math.max(
@@ -220,12 +398,11 @@ async function mergeVertices(pos, idx) {
     );
     if (v > maxAbs) maxAbs = v;
   }
-  const tol = Math.max(1e-4 * maxAbs, 1e-5);
+  // Tight enough that we don't fuse genuinely-distinct vertices but loose
+  // enough to merge floating-point duplicates from the exporter.
+  const tol = Math.max(1e-5 * Math.max(maxAbs, 1), 1e-6);
   const inv = 1 / tol;
 
-  // Open-addressing hash table. Slots store (qx, qy, qz, mappedIndex).
-  // Sized at ~2x the vertex count and rounded to next power-of-two so that
-  // we can use bitwise masking instead of a modulo for probe stepping.
   let capacity = 1;
   while (capacity < pos.count * 2) capacity <<= 1;
   const mask = capacity - 1;
@@ -256,13 +433,7 @@ async function mergeVertices(pos, idx) {
 
     let s = hash3(qx, qy, qz);
     while (slotsMap[s] !== -1) {
-      if (
-        slotsQx[s] === qx &&
-        slotsQy[s] === qy &&
-        slotsQz[s] === qz
-      ) {
-        break;
-      }
+      if (slotsQx[s] === qx && slotsQy[s] === qy && slotsQz[s] === qz) break;
       s = (s + 1) & mask;
     }
     if (slotsMap[s] === -1) {
@@ -288,13 +459,13 @@ async function mergeVertices(pos, idx) {
   return { mergedPositions, oldToNew, mergedCount };
 }
 
-function buildSubGeometry(mergedPositions, triangleVerts, triIndices) {
+function buildSubGeometry(mergedPositions, triV, triIndices) {
   const used = new Map();
   const newPositions = [];
   const newIndices = [];
   for (const t of triIndices) {
     for (let k = 0; k < 3; k++) {
-      const v = triangleVerts[t * 3 + k];
+      const v = triV[t * 3 + k];
       let mapped = used.get(v);
       if (mapped === undefined) {
         mapped = newPositions.length / 3;
@@ -320,8 +491,8 @@ function buildSubGeometry(mergedPositions, triangleVerts, triIndices) {
 function makePartMesh(geometry) {
   const mat = new THREE.MeshStandardMaterial({
     color: 0x8b95b8,
-    roughness: 0.45,
-    metalness: 0.35,
+    roughness: 0.42,
+    metalness: 0.32,
     flatShading: false,
   });
   const mesh = new THREE.Mesh(geometry, mat);
@@ -332,11 +503,9 @@ function makePartMesh(geometry) {
 
 // ---------- STEP parsing ----------
 //
-// occt-import-js (OpenCascade WASM) is run inside a Web Worker so that long
-// tessellations don't freeze the main thread. The main thread retains a
-// handle (\`activeStepWorker\`) so the user-visible Cancel button can call
-// \`cancelActiveStepWorker()\` to terminate the work cleanly.
-
+// occt-import-js runs in a Web Worker (see step.worker.js). We retain a
+// handle to the worker so the user-visible Cancel button can terminate it
+// without freezing the page.
 let activeStepWorker = null;
 
 export function cancelActiveStepWorker() {
@@ -351,8 +520,6 @@ export function cancelActiveStepWorker() {
 }
 
 async function parseStepFile(file, report) {
-  // Bail before transferring the buffer if the worker can't even be created
-  // (e.g. served from file://).
   let worker;
   try {
     worker = new Worker(new URL("./step.worker.js", import.meta.url), {
@@ -362,7 +529,7 @@ async function parseStepFile(file, report) {
     console.error(err);
     throw new Error(
       "Couldn't start the STEP decoder worker. " +
-        "Try serving the site over http(s) (e.g. \`python3 scripts/serve.py\`) instead of opening the file directly.",
+        "Try serving the site over http(s) (e.g. `python3 scripts/serve.py`) instead of opening the file directly.",
     );
   }
   activeStepWorker = worker;
@@ -382,8 +549,6 @@ async function parseStepFile(file, report) {
     worker.onerror = (e) => {
       reject(new Error(e.message || "STEP worker crashed"));
     };
-    // Transfer the underlying ArrayBuffer so we don't double our peak memory
-    // use; the main thread no longer needs it.
     worker.postMessage({ type: "parse", buffer }, [buffer]);
   }).finally(() => {
     if (activeStepWorker === worker) activeStepWorker = null;
@@ -403,6 +568,14 @@ async function parseStepFile(file, report) {
     if (!m.normal) g.computeVertexNormals();
     const mesh = makePartMesh(g);
     if (m.name) mesh.userData.sourceName = m.name;
+    if (m.color) {
+      // STEP colors come through as [r, g, b] floats in 0..1
+      mesh.userData.sourceColor = new THREE.Color(
+        m.color[0],
+        m.color[1],
+        m.color[2],
+      ).getHex();
+    }
     assembly.add(mesh);
     if (i % 16 === 0) {
       report?.(`Building mesh ${i + 1} / ${meshes.length}`);

@@ -103,9 +103,20 @@
             <span id="bboxLabel" class="muted small">— × — × —</span>
           </div>
           <div class="hud-row">
+            <span class="hud-group">
+              <span class="muted small">Colors</span>
+              <label class="toggle">
+                <input type="radio" name="colorMode" id="colorNatural" value="natural" checked />
+                <span>Natural</span>
+              </label>
+              <label class="toggle">
+                <input type="radio" name="colorMode" id="colorCategory" value="category" />
+                <span>By category</span>
+              </label>
+            </span>
             <label class="toggle">
-              <input type="checkbox" id="ghostToggle" checked />
-              <span>Show assembly outline</span>
+              <input type="checkbox" id="ghostToggle" />
+              <span>Assembly outline</span>
             </label>
             <label class="toggle">
               <input type="checkbox" id="wireToggle" />
@@ -137,7 +148,7 @@
     <footer class="footer">
       <span class="muted small">
         Heuristic classifier — verify parts before ordering. Not affiliated with VEX Robotics or Robosource.
-        <span id="buildTag" class="muted">· build 2026-05-28b</span>
+        <span id="buildTag" class="muted">· build 2026-05-28c</span>
       </span>
     </footer>
 

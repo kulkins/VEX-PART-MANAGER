@@ -2,7 +2,15 @@ import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 
 // The Viewer owns the Three.js scene, camera, lights, picking, ghost
-// outline, and the explode animation.
+// outline overlay, and the explode animation.
+//
+// Color modes:
+//   - "natural":  use the part's source color if the file provided one,
+//                 otherwise a deterministic palette color derived from the
+//                 part's id. This is the default and is what CAD users expect.
+//   - "category": tint every mesh by the classifier category (Structure,
+//                 Motion, Hardware, etc.). Useful for understanding what the
+//                 app detected.
 export class Viewer {
   constructor(canvas) {
     this.canvas = canvas;
@@ -31,23 +39,26 @@ export class Viewer {
     this._buildLights();
     this._buildGrid();
 
-    this.assembly = null; // currently loaded THREE.Group
-    this.ghostGroup = null; // edges overlay of original assembly
-    this.parts = []; // [{mesh, originalPos, targetPos, categoryId}]
-    this.explodeAmount = 0; // 0..1
+    this.assembly = null;
+    this.ghostGroup = null;
+    this.parts = [];
+    this.explodeAmount = 0;
     this.selectedMesh = null;
-    this.partColors = new Map(); // category id -> color
+    this.categoryColors = new Map();
+    this.colorMode = "natural";
+    this.ghostUserPref = null; // null = auto, true/false = explicit override
     this._raycaster = new THREE.Raycaster();
     this._pointer = new THREE.Vector2();
     this._onSelect = null;
+    this._explodeAnim = null;
 
     this._tick = this._tick.bind(this);
-    this._onPointerDown = this._onPointerDown.bind(this);
+    this._onPointerUp = this._onPointerUp.bind(this);
     this._pointerDownPos = null;
     canvas.addEventListener("pointerdown", (e) => {
       this._pointerDownPos = { x: e.clientX, y: e.clientY };
     });
-    canvas.addEventListener("pointerup", this._onPointerDown);
+    canvas.addEventListener("pointerup", this._onPointerUp);
 
     this.onResize();
     window.addEventListener("resize", () => this.onResize());
@@ -55,10 +66,10 @@ export class Viewer {
   }
 
   _buildLights() {
-    const hemi = new THREE.HemisphereLight(0xffffff, 0x202650, 0.55);
+    const hemi = new THREE.HemisphereLight(0xffffff, 0x202650, 0.65);
     this.scene.add(hemi);
 
-    const key = new THREE.DirectionalLight(0xffffff, 1.1);
+    const key = new THREE.DirectionalLight(0xffffff, 1.05);
     key.position.set(12, 18, 10);
     key.castShadow = true;
     key.shadow.mapSize.set(2048, 2048);
@@ -83,7 +94,6 @@ export class Viewer {
     this.scene.add(grid);
     this.grid = grid;
 
-    // Subtle floor for shadows
     const floorMat = new THREE.ShadowMaterial({ opacity: 0.18 });
     const floor = new THREE.Mesh(new THREE.PlaneGeometry(80, 80), floorMat);
     floor.rotation.x = -Math.PI / 2;
@@ -117,12 +127,9 @@ export class Viewer {
     this.explodeAmount = 0;
   }
 
-  // assembly: THREE.Group whose children are part meshes; each mesh.userData
-  // should already be populated by the classifier (partId, categoryId).
-  // categoryColors: Map(id -> hex color)
   loadAssembly(assembly, categoryColors) {
     this.clear();
-    this.partColors = categoryColors;
+    this.categoryColors = categoryColors;
     this.assembly = assembly;
 
     // Normalize: recenter on origin and scale so the longest dim is ~10 units.
@@ -135,21 +142,23 @@ export class Viewer {
     assembly.scale.setScalar(scale);
     this.viewScale = scale;
 
-    // Apply per-part colors and capture original positions
+    let partIndex = 0;
     assembly.traverse((c) => {
       if (!c.isMesh) return;
-      const color = categoryColors.get(c.userData.category) || 0x9aa3c6;
+      const baseColor = this._colorFor(c, partIndex++);
       c.material = new THREE.MeshStandardMaterial({
-        color: new THREE.Color(color),
+        color: new THREE.Color(baseColor),
         roughness: 0.42,
-        metalness: 0.28,
+        metalness: 0.32,
       });
       c.material.userData.baseColor = c.material.color.clone();
+      c.userData.naturalColor = this._naturalColorFor(c, partIndex - 1);
+      c.userData.categoryColor =
+        categoryColors.get(c.userData.category) || 0x9aa3c6;
       c.castShadow = true;
       c.receiveShadow = true;
     });
 
-    // Compute each part's center after the assembly transform is applied.
     assembly.updateMatrixWorld(true);
     this.parts = [];
     assembly.traverse((c) => {
@@ -167,26 +176,59 @@ export class Viewer {
 
     this._computeExplodeOffsets();
     this._buildGhostOutline();
+    this._updateGhostVisibility();
     this.frame();
   }
 
-  // For each part, compute an offset vector to use when fully exploded.
-  // Direction goes from the assembly center outward through the part's own
-  // center, biased by category so parts of the same kind cluster together.
+  _naturalColorFor(mesh, index) {
+    // Prefer the source CAD color if the parser stored one.
+    if (mesh.userData.sourceColor) return mesh.userData.sourceColor;
+    // Otherwise, deterministic golden-angle hue palette so adjacent parts get
+    // visually distinct colors. We avoid pure saturated colors so the model
+    // looks like rendered metal/plastic, not a candy box.
+    const golden = 0.61803398875;
+    const hue = (index * golden) % 1;
+    const sat = 0.18 + ((index * 7) % 10) * 0.02; // 0.18..0.36
+    const lit = 0.55 + ((index * 5) % 7) * 0.02; // 0.55..0.67
+    return new THREE.Color().setHSL(hue, sat, lit).getHex();
+  }
+
+  _colorFor(mesh, index) {
+    if (this.colorMode === "category") {
+      return this.categoryColors.get(mesh.userData.category) || 0x9aa3c6;
+    }
+    return this._naturalColorFor(mesh, index);
+  }
+
+  setColorMode(mode) {
+    if (mode !== "natural" && mode !== "category") return;
+    this.colorMode = mode;
+    if (!this.assembly) return;
+    this.assembly.traverse((c) => {
+      if (!c.isMesh) return;
+      const hex =
+        mode === "category"
+          ? c.userData.categoryColor
+          : c.userData.naturalColor;
+      const color = new THREE.Color(hex);
+      c.material.color.copy(color);
+      c.material.userData.baseColor = color.clone();
+    });
+  }
+
   _computeExplodeOffsets() {
     if (!this.parts.length) return;
     const center = new THREE.Vector3();
     for (const p of this.parts) center.add(p.worldCenter);
     center.divideScalar(this.parts.length);
 
-    // Per-category nudge so categories separate visually.
     const categoryDir = new Map();
     const baseDirs = [
-      new THREE.Vector3(-1, 0.3, 0),
-      new THREE.Vector3(1, 0.3, 0),
-      new THREE.Vector3(0, 1, 0),
-      new THREE.Vector3(0, -0.6, 1),
-      new THREE.Vector3(0, -0.6, -1),
+      new THREE.Vector3(-1.2, 0.3, 0),
+      new THREE.Vector3(1.2, 0.3, 0),
+      new THREE.Vector3(0, 1.1, 0),
+      new THREE.Vector3(0, -0.6, 1.1),
+      new THREE.Vector3(0, -0.6, -1.1),
       new THREE.Vector3(-1, -0.6, -1),
       new THREE.Vector3(1, -0.6, 1),
     ];
@@ -197,14 +239,11 @@ export class Viewer {
       categoryDir.set(id, baseDirs[i % baseDirs.length].clone().normalize());
     });
 
-    // Bounding-box diagonal sets explode distance (~1.5x).
     const bbox = new THREE.Box3();
     for (const p of this.parts) bbox.expandByPoint(p.worldCenter);
     const spread = bbox.getSize(new THREE.Vector3()).length() || 5;
     const explodeRadius = Math.max(spread, 6) * 1.1;
 
-    // Pre-compute per-category counters so equal parts in a category can fan
-    // out instead of stacking on top of each other.
     const categoryCount = new Map();
     for (const p of this.parts) {
       const id = p.mesh.userData.category;
@@ -223,11 +262,12 @@ export class Viewer {
       const radialDir = radial.clone().normalize();
 
       const catDir = categoryDir.get(id) || radialDir;
-      const dir = radialDir.clone().multiplyScalar(0.45)
+      const dir = radialDir
+        .clone()
+        .multiplyScalar(0.4)
         .add(catDir.clone().multiplyScalar(1.4))
         .normalize();
 
-      // Fan within a category: add a tangential jitter spread across the count
       const tangent = new THREE.Vector3(-catDir.z, 0, catDir.x).normalize();
       const fanOffset = tangent
         .clone()
@@ -256,22 +296,44 @@ export class Viewer {
         new THREE.LineBasicMaterial({
           color: 0x6ee7ff,
           transparent: true,
-          opacity: 0.16,
+          opacity: 0.22,
           depthWrite: false,
         }),
       );
-      // Apply the part's world transform so the outline is positioned correctly
       c.updateMatrixWorld(true);
       line.applyMatrix4(c.matrixWorld);
-      line.userData.persistent = true;
       group.add(line);
     });
     this.ghostGroup = group;
     this.scene.add(group);
   }
 
+  // User-controlled override. `null` resets to automatic (driven by explode).
   setGhostVisible(visible) {
-    if (this.ghostGroup) this.ghostGroup.visible = visible;
+    this.ghostUserPref = visible;
+    this._updateGhostVisibility();
+  }
+
+  _updateGhostVisibility() {
+    if (!this.ghostGroup) return;
+    if (this.ghostUserPref === true) {
+      this.ghostGroup.visible = true;
+      this._setGhostOpacity(0.45);
+    } else if (this.ghostUserPref === false) {
+      this.ghostGroup.visible = false;
+    } else {
+      // Auto: invisible while assembled, fade in as we explode.
+      const a = this.explodeAmount;
+      this.ghostGroup.visible = a > 0.01;
+      this._setGhostOpacity(0.05 + a * 0.45);
+    }
+  }
+
+  _setGhostOpacity(o) {
+    if (!this.ghostGroup) return;
+    this.ghostGroup.traverse((c) => {
+      if (c.material) c.material.opacity = o;
+    });
   }
 
   setWireframe(on) {
@@ -281,18 +343,17 @@ export class Viewer {
     });
   }
 
-  // amount in [0, 1]
   setExplode(amount) {
     this.explodeAmount = THREE.MathUtils.clamp(amount, 0, 1);
     for (const p of this.parts) {
       const offset = p.explodeOffset.clone().multiplyScalar(this.explodeAmount);
-      // explodeOffset was computed in world space; assembly has uniform scale
       const local = offset.clone().divideScalar(this.viewScale || 1);
       p.mesh.position.copy(p.originalPos).add(local);
     }
+    this._updateGhostVisibility();
   }
 
-  animateExplode(target, duration = 1200) {
+  animateExplode(target, duration = 1400) {
     cancelAnimationFrame(this._explodeAnim);
     const start = performance.now();
     const from = this.explodeAmount;
@@ -321,13 +382,11 @@ export class Viewer {
     this.controls.target.copy(target);
     this.controls.update();
 
-    // Move grid below the model so it always sits on the floor
     this.grid.position.y = box.min.y - 0.01;
     this.floor.position.y = box.min.y - 0.01;
   }
 
   highlight(mesh) {
-    // Reset previous highlight
     if (this.selectedMesh && this.selectedMesh.material?.userData?.baseColor) {
       this.selectedMesh.material.color.copy(
         this.selectedMesh.material.userData.baseColor,
@@ -337,15 +396,13 @@ export class Viewer {
     this.selectedMesh = mesh || null;
     if (mesh) {
       mesh.material.emissive = new THREE.Color(0x224a6e);
-      mesh.material.color.copy(mesh.material.userData.baseColor).lerp(
-        new THREE.Color(0xffffff),
-        0.18,
-      );
+      mesh.material.color
+        .copy(mesh.material.userData.baseColor)
+        .lerp(new THREE.Color(0xffffff), 0.18);
     }
   }
 
-  _onPointerDown(e) {
-    // Treat as click only if pointer didn't move (so dragging to rotate works)
+  _onPointerUp(e) {
     if (!this._pointerDownPos) return;
     const dx = e.clientX - this._pointerDownPos.x;
     const dy = e.clientY - this._pointerDownPos.y;

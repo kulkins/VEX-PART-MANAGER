@@ -573,6 +573,20 @@ body {
   backdrop-filter: blur(8px);
   pointer-events: auto;
   font-size: 12px;
+  flex-wrap: wrap;
+}
+
+.hud-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding-right: 4px;
+  border-right: 1px solid var(--border);
+}
+
+.hud-group + .toggle,
+.hud-group + .slider-toggle {
+  margin-left: 0;
 }
 
 .toggle {
